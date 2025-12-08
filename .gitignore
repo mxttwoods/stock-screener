@@ -10,3 +10,5 @@ wheels/
 .venv
 screener_results.csv
 uv.lock
+IDEAS.md
+RULES.md
