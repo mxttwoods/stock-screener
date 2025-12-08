@@ -1,0 +1,10 @@
+[project]
+name = "stock-screener"
+version = "0.1.0"
+description = "GARP stock screener using yfinance"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "yfinance>=0.2.49",
+    "pandas>=2.0.0",
+]
