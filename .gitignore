@@ -12,3 +12,6 @@ screener_results.csv
 uv.lock
 IDEAS.md
 RULES.md
+
+# Environment variables (contains API keys)
+.env

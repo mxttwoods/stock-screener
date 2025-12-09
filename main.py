@@ -3,18 +3,28 @@ GARP Stock Screener - Two-Stage Implementation
 Based on RULES.md and IDEAS.md methodology
 """
 
+import os
 import yfinance as yf
 from yfinance import EquityQuery
 import pandas as pd
+import requests
 from typing import Optional
+from dotenv import load_dotenv
 import warnings
 
 warnings.filterwarnings("ignore")
 
+# Load environment variables from .env file
+load_dotenv()
+
+# Alpha Vantage API configuration
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+
 # =============================================================================
 # CONFIGURATION - Thresholds from RULES.md / IDEAS.md
 # =============================================================================
-MCAP_MIN = 15_000_000_000 / 3  # $15 billion
+MCAP_MIN = 15_000_000_000  # $15 billion
 MCAP_MAX = 500_000_000_000 * 4  # $1 trillion
 PE_MAX = 45.0
 PEG_MAX = 1
@@ -28,6 +38,69 @@ CAGR_MIN = 0.06  # 6%
 # Buffett/Ackman quality thresholds (lenient for Stage 1, strict in Stage 2)
 GROSS_MARGIN_MIN = 0.25  # 25% - moat indicator (Buffett prefers 40%+)
 OPERATING_MARGIN_MIN = 0.12  # 12% - efficiency indicator
+
+
+# =============================================================================
+# ALPHA VANTAGE API FUNCTIONS
+# =============================================================================
+def fetch_alpha_vantage_overview(symbol: str) -> Optional[dict]:
+    """
+    Fetch company fundamental data from Alpha Vantage.
+    Returns key metrics like forward P/E, PEG, analyst targets, etc.
+    """
+    if not ALPHA_VANTAGE_API_KEY:
+        return None
+
+    try:
+        params = {
+            "function": "OVERVIEW",
+            "symbol": symbol,
+            "apikey": ALPHA_VANTAGE_API_KEY,
+        }
+        response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
+        data = response.json()
+
+        # Check for API limit or error
+        if "Note" in data or "Error Message" in data or not data:
+            return None
+
+        return data
+    except Exception:
+        return None
+
+
+def get_alpha_vantage_metrics(av_data: Optional[dict]) -> dict:
+    """
+    Extract useful metrics from Alpha Vantage company overview.
+    Returns dict with forward P/E, PEG, analyst target, etc.
+    """
+    if not av_data:
+        return {}
+
+    def safe_float(value):
+        try:
+            if value in [None, "None", "-", ""]:
+                return None
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "AV Forward P/E": safe_float(av_data.get("ForwardPE")),
+        "AV PEG": safe_float(av_data.get("PEGRatio")),
+        "AV Analyst Target": safe_float(av_data.get("AnalystTargetPrice")),
+        "AV 52W High": safe_float(av_data.get("52WeekHigh")),
+        "AV 52W Low": safe_float(av_data.get("52WeekLow")),
+        "AV Beta": safe_float(av_data.get("Beta")),
+        "AV Profit Margin": safe_float(av_data.get("ProfitMargin")),
+        "AV Operating Margin": safe_float(av_data.get("OperatingMarginTTM")),
+        "AV Quarterly Earnings Growth": safe_float(
+            av_data.get("QuarterlyEarningsGrowthYOY")
+        ),
+        "AV Quarterly Revenue Growth": safe_float(
+            av_data.get("QuarterlyRevenueGrowthYOY")
+        ),
+    }
 
 
 def build_stage1_query() -> EquityQuery:
@@ -200,6 +273,26 @@ def calculate_cagr(values: list, years: int = 3) -> Optional[float]:
         return None
 
 
+def calculate_graham_number(eps: float, book_value_per_share: float) -> Optional[float]:
+    """
+    Calculate Benjamin Graham's intrinsic value (Graham Number).
+    Formula: √(22.5 × EPS × Book Value Per Share)
+
+    22.5 = 15 (max P/E) × 1.5 (max P/B) from Graham's defensive investor criteria.
+    Stocks trading below Graham Number are considered undervalued.
+    """
+    try:
+        if eps is None or book_value_per_share is None:
+            return None
+        if eps <= 0 or book_value_per_share <= 0:
+            return None  # Graham Number requires positive EPS and BVPS
+
+        graham_number = (22.5 * eps * book_value_per_share) ** 0.5
+        return graham_number
+    except Exception:
+        return None
+
+
 def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     """
     Stage 2: Deep financial analysis on Stage 1 candidates.
@@ -260,6 +353,22 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             analyst_rating = info.get("recommendationKey", "N/A")
             num_analysts = info.get("numberOfAnalystOpinions", 0)
 
+            # Calculate Graham Number (intrinsic value)
+            eps = info.get("trailingEps", None)
+            book_value_per_share = info.get("bookValue", None)
+            graham_number = calculate_graham_number(eps, book_value_per_share)
+
+            # Graham margin of safety: is current price below Graham Number?
+            graham_upside = None
+            is_graham_undervalued = False
+            if graham_number and current_price and current_price > 0:
+                graham_upside = ((graham_number - current_price) / current_price) * 100
+                is_graham_undervalued = current_price < graham_number
+
+            # Fetch Alpha Vantage data (if API key available)
+            av_data = fetch_alpha_vantage_overview(symbol)
+            av_metrics = get_alpha_vantage_metrics(av_data)
+
             # Check Stage 2 thresholds
             passed = True
             fail_reasons = []
@@ -289,31 +398,39 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             status = "PASS" if passed else f"FAIL ({', '.join(fail_reasons)})"
             print(status)
 
-            results.append(
-                {
-                    "Symbol": symbol,
-                    "Name": info.get("shortName", "N/A"),
-                    "Sector": info.get("sector", "N/A"),
-                    "Market Cap ($B)": market_cap / 1e9,
-                    "P/E": info.get("trailingPE", None),
-                    "PEG": info.get("pegRatio", None),
-                    "D/E": info.get("debtToEquity", None),
-                    "ROE (%)": (info.get("returnOnEquity", 0) or 0) * 100,
-                    "Gross Margin (%)": (info.get("grossMargins", 0) or 0) * 100,
-                    "Op Margin (%)": (info.get("operatingMargins", 0) or 0) * 100,
-                    "P/FCF": pfcf,
-                    "ROIC (%)": roic * 100 if roic else None,
-                    "3Y Rev CAGR (%)": rev_cagr * 100 if rev_cagr else None,
-                    "3Y EPS CAGR (%)": eps_cagr * 100 if eps_cagr else None,
-                    # Analyst data
-                    "Analyst Rating": analyst_rating,
-                    "# Analysts": num_analysts,
-                    "Target Price": target_price,
-                    "Current Price": current_price,
-                    "Upside (%)": upside_pct,
-                    "Stage 2 Pass": passed,
-                }
-            )
+            # Build result dict with all metrics
+            result_row = {
+                "Symbol": symbol,
+                "Name": info.get("shortName", "N/A"),
+                "Sector": info.get("sector", "N/A"),
+                "Market Cap ($B)": market_cap / 1e9,
+                "P/E": info.get("trailingPE", None),
+                "PEG": info.get("pegRatio", None),
+                "D/E": info.get("debtToEquity", None),
+                "ROE (%)": (info.get("returnOnEquity", 0) or 0) * 100,
+                "Gross Margin (%)": (info.get("grossMargins", 0) or 0) * 100,
+                "Op Margin (%)": (info.get("operatingMargins", 0) or 0) * 100,
+                "P/FCF": pfcf,
+                "ROIC (%)": roic * 100 if roic else None,
+                "3Y Rev CAGR (%)": rev_cagr * 100 if rev_cagr else None,
+                "3Y EPS CAGR (%)": eps_cagr * 100 if eps_cagr else None,
+                # Analyst data
+                "Analyst Rating": analyst_rating,
+                "# Analysts": num_analysts,
+                "Target Price": target_price,
+                "Current Price": current_price,
+                "Upside (%)": upside_pct,
+                # Graham Number (intrinsic value)
+                "Graham Number": graham_number,
+                "Graham Upside (%)": graham_upside,
+                "Graham Undervalued": is_graham_undervalued,
+                "Stage 2 Pass": passed,
+            }
+
+            # Add Alpha Vantage metrics if available
+            result_row.update(av_metrics)
+
+            results.append(result_row)
 
         except Exception as e:
             print(f"ERROR ({e})")
