@@ -7,6 +7,7 @@ import os
 import yfinance as yf
 from yfinance import EquityQuery
 import pandas as pd
+import numpy as np
 import requests
 from typing import Optional
 from dotenv import load_dotenv
@@ -439,6 +440,209 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+# =============================================================================
+# PORTFOLIO OPTIMIZATION
+# =============================================================================
+def build_optimized_portfolio(
+    passed_df: pd.DataFrame, min_stocks: int = 4, max_weight: float = 0.15
+) -> pd.DataFrame:
+    """
+    Build a Sharpe-optimized portfolio from screener results.
+
+    Rules:
+    - Minimum 4 stocks for diversification
+    - Maximum 15% in any single name
+    - Sector diversification (max 2 per sector initially)
+    - Fallback: equal weight with BIL (T-bills) and TLT (20yr bonds) if < 4 stocks
+    """
+    print("\n" + "=" * 60)
+    print("PORTFOLIO OPTIMIZATION - Sharpe Ratio Maximization")
+    print("=" * 60)
+
+    # Get unique symbols and sectors
+    if passed_df.empty or len(passed_df) < min_stocks:
+        print(
+            f"\nInsufficient stocks ({len(passed_df)}) for optimization. Using fallback strategy."
+        )
+        return _build_fallback_portfolio(passed_df)
+
+    # Apply sector diversification - max 2 stocks per sector initially
+    symbols = []
+    sector_counts = {}
+
+    for _, row in passed_df.iterrows():
+        sector = row.get("Sector", "Unknown")
+        if sector_counts.get(sector, 0) < 2:  # Max 2 per sector
+            symbols.append(row["Symbol"])
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        if len(symbols) >= 10:  # Cap at 10 stocks for optimization
+            break
+
+    # Ensure minimum stocks
+    if len(symbols) < min_stocks:
+        # Add more stocks if needed, relaxing sector constraint
+        for _, row in passed_df.iterrows():
+            if row["Symbol"] not in symbols:
+                symbols.append(row["Symbol"])
+            if len(symbols) >= min_stocks:
+                break
+
+    print(f"Selected {len(symbols)} stocks for optimization: {', '.join(symbols)}")
+
+    # Fetch historical data for optimization
+    try:
+        # Download historical returns
+        print("Fetching 3-year historical data...")
+        data = yf.download(symbols, period="3y", progress=False)["Close"]
+
+        if data.empty:
+            print("Could not fetch historical data. Using equal weight.")
+            return _build_equal_weight_portfolio(symbols)
+
+        # Calculate daily returns
+        returns = data.pct_change().dropna()
+
+        if len(returns) < 30:
+            print("Insufficient historical data. Using equal weight.")
+            return _build_equal_weight_portfolio(symbols)
+
+        # Calculate expected returns and covariance
+        mean_returns = returns.mean() * 252  # Annualize
+        cov_matrix = returns.cov() * 252  # Annualize
+
+        # Optimize for Sharpe ratio with constraints
+        n_assets = len(symbols)
+        risk_free_rate = 0.045  # Current T-bill rate ~4.5%
+
+        # Simple optimization: iterative approach with constraints
+        best_sharpe = -np.inf
+        best_weights = np.array([1 / n_assets] * n_assets)  # Start with equal weight
+
+        # Monte Carlo simulation for optimization
+        n_portfolios = 10000
+        for _ in range(n_portfolios):
+            # Generate random weights
+            weights = np.random.random(n_assets)
+            weights = weights / weights.sum()  # Normalize to 1
+
+            # Apply max weight constraint
+            while np.max(weights) > max_weight:
+                excess = weights - max_weight
+                excess[excess < 0] = 0
+                weights = weights - excess
+                weights = weights / weights.sum()
+
+            # Calculate portfolio metrics
+            port_return = np.dot(weights, mean_returns)
+            port_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            sharpe = (port_return - risk_free_rate) / port_volatility
+
+            if sharpe > best_sharpe:
+                best_sharpe = sharpe
+                best_weights = weights.copy()
+
+        # Build result dataframe
+        portfolio_df = pd.DataFrame(
+            {
+                "Symbol": symbols,
+                "Weight (%)": best_weights * 100,
+                "Sector": [
+                    passed_df[passed_df["Symbol"] == s]["Sector"].values[0]
+                    if s in passed_df["Symbol"].values
+                    else "N/A"
+                    for s in symbols
+                ],
+            }
+        )
+
+        # Sort by weight
+        portfolio_df = portfolio_df.sort_values("Weight (%)", ascending=False)
+
+        # Calculate portfolio metrics
+        port_return = np.dot(best_weights, mean_returns) * 100
+        port_volatility = (
+            np.sqrt(np.dot(best_weights.T, np.dot(cov_matrix, best_weights))) * 100
+        )
+
+        print(f"\nOptimized Portfolio:")
+        print(portfolio_df.to_string(index=False))
+        print(f"\nPortfolio Metrics:")
+        print(f"  Expected Annual Return: {port_return:.1f}%")
+        print(f"  Expected Volatility: {port_volatility:.1f}%")
+        print(f"  Sharpe Ratio: {best_sharpe:.2f}")
+        print(f"  Max Position: {portfolio_df['Weight (%)'].max():.1f}%")
+
+        # Export portfolio
+        portfolio_df.to_csv("portfolio_allocation.csv", index=False)
+        print(f"\nPortfolio exported to: portfolio_allocation.csv")
+
+        return portfolio_df
+
+    except Exception as e:
+        print(f"Optimization failed: {e}. Using equal weight.")
+        return _build_equal_weight_portfolio(symbols)
+
+
+def _build_fallback_portfolio(passed_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fallback portfolio: equal weight with stock picks + BIL + TLT.
+    Used when fewer than 4 stocks pass screening.
+    """
+    print("\nBuilding fallback portfolio with BIL (T-bills) and TLT (20-yr bonds)...")
+
+    # Get any passing stocks
+    stock_symbols = passed_df["Symbol"].tolist() if not passed_df.empty else []
+
+    # Add BIL and TLT
+    all_symbols = stock_symbols + ["BIL", "TLT"]
+
+    # Equal weight
+    weight = 100 / len(all_symbols)
+
+    portfolio_df = pd.DataFrame(
+        {
+            "Symbol": all_symbols,
+            "Weight (%)": [weight] * len(all_symbols),
+            "Sector": [
+                passed_df[passed_df["Symbol"] == s]["Sector"].values[0]
+                if s in passed_df["Symbol"].values
+                else ("T-Bills" if s == "BIL" else "Bonds")
+                for s in all_symbols
+            ],
+        }
+    )
+
+    print(f"\nFallback Portfolio (Equal Weight):")
+    print(portfolio_df.to_string(index=False))
+
+    # Export
+    portfolio_df.to_csv("portfolio_allocation.csv", index=False)
+    print(f"\nPortfolio exported to: portfolio_allocation.csv")
+
+    return portfolio_df
+
+
+def _build_equal_weight_portfolio(symbols: list) -> pd.DataFrame:
+    """Simple equal-weight portfolio when optimization fails."""
+    weight = 100 / len(symbols)
+
+    portfolio_df = pd.DataFrame(
+        {
+            "Symbol": symbols,
+            "Weight (%)": [weight] * len(symbols),
+            "Sector": ["N/A"] * len(symbols),
+        }
+    )
+
+    print(f"\nEqual Weight Portfolio:")
+    print(portfolio_df.to_string(index=False))
+
+    portfolio_df.to_csv("portfolio_allocation.csv", index=False)
+    print(f"\nPortfolio exported to: portfolio_allocation.csv")
+
+    return portfolio_df
+
+
 def main():
     """Main entry point for the GARP stock screener."""
     print("\n" + "=" * 60)
@@ -492,6 +696,10 @@ def main():
     results_df = results_df[results_df["Stage 2 Pass"]]
     results_df.to_csv(output_file, index=False)
     print(f"\nFull results exported to: {output_file}")
+
+    # Build optimized portfolio from passing stocks
+    if not passed_df.empty:
+        build_optimized_portfolio(passed_df)
 
 
 if __name__ == "__main__":

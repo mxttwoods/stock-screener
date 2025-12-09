@@ -15,3 +15,4 @@ RULES.md
 
 # Environment variables (contains API keys)
 .env
+portfolio_allocation.csv
