@@ -31,20 +31,20 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 # =============================================================================
 # CONFIGURATION - Thresholds from RULES.md / IDEAS.md
 # =============================================================================
-MCAP_MIN = 15_000_000_000  # $15 billion
-MCAP_MAX = 500_000_000_000 * 4  # $1 trillion
-PE_MAX = 45.0
-PEG_MAX = 1
+MCAP_MIN = 25_000_000_000  # $25 billion
+MCAP_MAX = 4_000_000_000_000  # $4 trillion
+PE_MAX = 50.0
+PEG_MAX = 3
 DE_MAX = 100  # More lenient - validate in Stage 2
-ROE_MIN = 0.15  # 15%
+ROE_MIN = 0.10  # 10%
 GROWTH_MIN = 0.06  # 6%
-PFCF_MAX = 40.0
-ROIC_MIN = 0.10  # 10%
+PFCF_MAX = 30.0
+ROIC_MIN = 0.07  # 7%
 CAGR_MIN = 0.06  # 6%
 
 # Buffett/Ackman quality thresholds (lenient for Stage 1, strict in Stage 2)
-GROSS_MARGIN_MIN = 0.25  # 25% - moat indicator (Buffett prefers 40%+)
-OPERATING_MARGIN_MIN = 0.12  # 12% - efficiency indicator
+GROSS_MARGIN_MIN = 0.35  # 35% - moat indicator (Buffett prefers 40%+)
+OPERATING_MARGIN_MIN = 0.15  # 15% - efficiency indicator
 
 
 # =============================================================================
@@ -332,7 +332,9 @@ def classify_action(conviction: int, graham_undervalued: bool, upside: float) ->
         return "⚪ HOLD"
 
 
-def generate_ai_thesis(stock_data: dict, ticker_info: dict) -> str:
+def generate_ai_thesis(
+    stock_data: dict, ticker_info: dict, conviction_score: int, risks: list
+) -> str:
     """
     Generate an AI-powered investment thesis using OpenAI.
     """
@@ -345,25 +347,41 @@ def generate_ai_thesis(stock_data: dict, ticker_info: dict) -> str:
         name = stock_data.get("Name", "Unknown")
         sector = stock_data.get("Sector", "Unknown")
 
-        prompt = f"""You are a professional equity analyst. Write a 2-3 sentence investment thesis for {symbol} ({name}).
+        prompt = f"""You are a Lead Equity Analyst. Synthesize the following data into a compelling 2-3 sentence investment thesis for {symbol} ({name}).
 
-Key metrics:
+Financials:
 - Sector: {sector}
-- P/E: {stock_data.get("P/E", "N/A")}
+- P/E: {stock_data.get("P/E", "N/A")} (PEG: {stock_data.get("PEG", "N/A")})
 - ROIC: {stock_data.get("ROIC (%)", "N/A")}%
-- 3Y Revenue CAGR: {stock_data.get("3Y Rev CAGR (%)", "N/A")}%
+- 3Y Rev CAGR: {stock_data.get("3Y Rev CAGR (%)", "N/A")}%
 - P/FCF: {stock_data.get("P/FCF", "N/A")}
-- Graham Number: ${stock_data.get("Graham Number", "N/A"):.2f} vs Current: ${stock_data.get("Current Price", "N/A")}
-- Analyst Rating: {stock_data.get("Analyst Rating", "N/A")}
-- Upside to Target: {stock_data.get("Upside (%)", "N/A")}%
+- Margins: Gross {stock_data.get("Gross Margin (%)", "N/A")}%, Op {stock_data.get("Op Margin (%)", "N/A")}%
 
-Write a concise thesis covering: 1) Why this stock is attractive 2) Key risk 3) Fair value assessment.
-Keep it under 75 words. Be specific with numbers."""
+Valuation Models:
+- Graham Number: ${stock_data.get("Graham Number", "N/A")} (Undervalued: {stock_data.get("Graham Undervalued", "N/A")})
+- DCF Fair Value: ${stock_data.get("DCF Fair Value", "N/A")} (Upside: {stock_data.get("DCF Upside (%)", "N/A")}%)
+- Analyst Target: ${stock_data.get("Target Price", "N/A")} (Upside: {stock_data.get("Upside (%)", "N/A")}%)
+
+Sentiment & Momentum:
+- News Sentiment: {stock_data.get("News Sentiment Label", "N/A")} (Score: {stock_data.get("News Sentiment Score", "N/A")})
+- Earnings Surprise (Avg): {stock_data.get("Earnings Surprise Avg (%)", "N/A")}%
+- Analyst Rating: {stock_data.get("Analyst Rating", "N/A")}
+
+Risk Profile:
+- Conviction Score: {conviction_score}/10
+- Identified Risks: {", ".join(risks) if risks else "None"}
+- Debt/Equity: {stock_data.get("D/E", "N/A")}
+
+Task:
+1. Synthesize the signals (e.g., "Undervalued by DCF but facing bearish sentiment").
+2. Highlight the primary driver for a BUY or WATCH decision.
+3. Mention the most critical risk.
+4. Be concise (max 80 words). Use numbers."""
 
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.1",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
+            max_tokens=200,
             temperature=0.7,
         )
 
@@ -400,8 +418,9 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
         except:
             ticker_info = {}
 
-        # Calculate conviction score
-        conviction, conviction_reasons = calculate_conviction_score(stock_data)
+        # Use pre-calculated conviction score
+        conviction = stock_data.get("Conviction Score", 5)
+        conviction_reasons = stock_data.get("Conviction Reasons", "").split("; ")
 
         # Get risk warnings
         risks = get_risk_warnings(stock_data, ticker_info)
@@ -414,7 +433,7 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
         )
 
         # Generate AI thesis
-        thesis = generate_ai_thesis(stock_data, ticker_info)
+        thesis = generate_ai_thesis(stock_data, ticker_info, conviction, risks)
 
         advice_data.append(
             {
@@ -631,20 +650,22 @@ def build_stage1_query() -> EquityQuery:
         EquityQuery("gte", ["epsgrowth.lasttwelvemonths", GROWTH_MIN]),
         # P/E < 50
         EquityQuery("btwn", ["peratio.lasttwelvemonths", 5, PE_MAX]),
-        # PEG < 1.1
+        # PEG < 3
         EquityQuery("lte", ["pegratio_5y", PEG_MAX]),
-        # D/E < 0.5
-        # EquityQuery("btwn", ["totaldebtequity.lasttwelvemonths", 0, DE_MAX]),
-        # ROE >= 15%
+        # D/E < 100 (1.0)
+        EquityQuery("btwn", ["totaldebtequity.lasttwelvemonths", 0, DE_MAX]),
+        # ROE >= 10%
         EquityQuery("gte", ["returnonequity.lasttwelvemonths", ROE_MIN]),
+        # ROIC Proxy (Return on Total Capital) >= 7%
+        EquityQuery("gte", ["returnontotalcapital.lasttwelvemonths", ROIC_MIN]),
         # Revenue Growth >= 6%
         EquityQuery("gte", ["totalrevenues1yrgrowth.lasttwelvemonths", GROWTH_MIN]),
         EquityQuery("gte", ["quarterlyrevenuegrowth.quarterly", GROWTH_MIN]),
         # EBITDA Growth >= 6%
         EquityQuery("gte", ["ebitda1yrgrowth.lasttwelvemonths", GROWTH_MIN]),
-        # Gross Margin >= 25% (Buffett moat indicator)
+        # Gross Margin >= 35% (Buffett moat indicator)
         EquityQuery("gte", ["grossprofitmargin.lasttwelvemonths", GROSS_MARGIN_MIN]),
-        # Operating Margin >= 12% (efficiency)
+        # Operating Margin >= 15% (efficiency)
         EquityQuery("gte", ["ebitdamargin.lasttwelvemonths", OPERATING_MARGIN_MIN]),
     ]
     return EquityQuery("and", filters)
@@ -967,6 +988,11 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             result_row.update(earnings_data)
             result_row.update(sentiment_data)
 
+            # Calculate Conviction Score immediately
+            conviction, conviction_reasons = calculate_conviction_score(result_row)
+            result_row["Conviction Score"] = conviction
+            result_row["Conviction Reasons"] = "; ".join(conviction_reasons)
+
             results.append(result_row)
 
         except Exception as e:
@@ -1199,8 +1225,9 @@ def main():
         print("\nNo stocks passed Stage 2 analysis.")
         return
 
-    # Filter to only passing stocks
+    # Filter to only passing stocks and sort by Conviction Score (descending)
     passed_df = results_df[results_df["Stage 2 Pass"]].copy()
+    passed_df = passed_df.sort_values("Conviction Score", ascending=False)
 
     # Display results
     print("\n" + "=" * 60)
