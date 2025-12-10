@@ -1,22 +1,22 @@
 market_cap:
-  min: 20000000000
-  max: 400000000000000
+  min: 20000000000 # 20B
+  max: 400000000000000 # 4T
 beta:
-  min: 0.0
-  max: 2.0
+  min: 0.50
+  max: 2.5
 valuation:
   pe_max: 50.0
   peg_max: 3.0
-  pfcf_max: 40.0
+  pfcf_max: 60.0
 profitability:
-  roe_min_pct: 10.0
+  roe_min_pct: 6.0 # 10
   roa_min_pct: 5.0
   roic_min_pct: 6.0
   gross_margin_min_pct: 35.0
   operating_margin_min_pct: 15.0
 growth:
   fiftytwowk_percentchange_min_pct: -70.0
-  fiftytwowk_percentchange_max_pct: 20.0
+  fiftytwowk_percentchange_max_pct: 30.0
   revenue_growth_min_pct: 6.0
   earnings_growth_min_pct: 6.0
   cagr_min_pct: 6.0
@@ -28,6 +28,7 @@ analyst:
   - buy
   - strong_buy
   - outperform
+  - hold
 excluded_symbols:
 - GME
 - AMC

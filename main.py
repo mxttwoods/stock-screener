@@ -449,13 +449,22 @@ def generate_ai_thesis(
 
         prompt = f"""You are a Lead Equity Analyst. Synthesize the following data into a compelling 2-3 sentence investment thesis for {symbol} ({name}).
 
-Financials:
+Company Profile:
 - Sector: {sector}
-- P/E: {stock_data.get("P/E", "N/A")} (PEG: {stock_data.get("PEG", "N/A")})
+- Market Cap: ${stock_data.get("Market Cap ($B)", "N/A"):.2f}B
+- Analyst Coverage: {stock_data.get("# Analysts", "N/A")} analysts
+
+Financials & Profitability:
+- P/E: {stock_data.get("P/E", "N/A")} (Forward P/E: {stock_data.get("AV Forward P/E", "N/A")})
+- PEG: {stock_data.get("PEG", "N/A")}
+- ROE: {stock_data.get("ROE (%)", "N/A")}%
 - ROIC: {stock_data.get("ROIC (%)", "N/A")}%
-- 3Y Rev CAGR: {stock_data.get("3Y Rev CAGR (%)", "N/A")}%
-- P/FCF: {stock_data.get("P/FCF", "N/A")}
 - Margins: Gross {stock_data.get("Gross Margin (%)", "N/A")}%, Op {stock_data.get("Op Margin (%)", "N/A")}%
+
+Growth:
+- 3Y Revenue CAGR: {stock_data.get("3Y Rev CAGR (%)", "N/A")}%
+- Quarterly Revenue Growth (YoY): {stock_data.get("AV Quarterly Revenue Growth", "N/A")}%
+- Quarterly Earnings Growth (YoY): {stock_data.get("AV Quarterly Earnings Growth", "N/A")}%
 
 Valuation Models:
 - Graham Number: ${stock_data.get("Graham Number", "N/A")} (Undervalued: {stock_data.get("Graham Undervalued", "N/A")})
@@ -463,6 +472,7 @@ Valuation Models:
 - Analyst Target: ${stock_data.get("Target Price", "N/A")} (Upside: {stock_data.get("Upside (%)", "N/A")}%)
 
 Sentiment & Momentum:
+- Price vs 52W Range: Current ${stock_data.get("Current Price", "N/A")} (Range: ${stock_data.get("AV 52W Low", "N/A")} - ${stock_data.get("AV 52W High", "N/A")})
 - News Sentiment: {stock_data.get("News Sentiment Label", "N/A")} (Score: {stock_data.get("News Sentiment Score", "N/A")})
 - Earnings Surprise (Avg): {stock_data.get("Earnings Surprise Avg (%)", "N/A")}%
 - Analyst Rating: {stock_data.get("Analyst Rating", "N/A")}
@@ -476,7 +486,7 @@ Task:
 1. Synthesize the signals (e.g., "Undervalued by DCF but facing bearish sentiment").
 2. Highlight the primary driver for a BUY or WATCH decision.
 3. Mention the most critical risk.
-4. Be concise (max 80 words). Use numbers. Be formal, direct, and clear this is financial advice."""
+4. Be concise (max 80 words). Use numbers. Be formal, direct, and do not provide financial advice."""
 
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -757,7 +767,7 @@ def build_stage1_query() -> EquityQuery:
         EquityQuery("gte", ["basicepscontinuingoperations.lasttwelvemonths", 0.001]),
         EquityQuery("gte", ["epsgrowth.lasttwelvemonths", GROWTH_MIN]),
         # P/E < 50
-        EquityQuery("btwn", ["peratio.lasttwelvemonths", 5, PE_MAX]),
+        EquityQuery("btwn", ["peratio.lasttwelvemonths", 10, PE_MAX]),
         # PEG < 3
         EquityQuery("lte", ["pegratio_5y", PEG_MAX]),
         # D/E < 100 (1.0)
@@ -1169,7 +1179,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
 # PORTFOLIO OPTIMIZATION
 # =============================================================================
 def build_optimized_portfolio(
-    passed_df: pd.DataFrame, min_stocks: int = 4, max_weight: float = 0.15
+    passed_df: pd.DataFrame, min_stocks: int = 6, max_weight: float = 0.20
 ) -> pd.DataFrame:
     """
     Build a Sharpe-optimized portfolio from screener results.
@@ -1194,14 +1204,13 @@ def build_optimized_portfolio(
     # Apply sector diversification - max 2 stocks per sector initially
     symbols = []
     sector_counts = {}
-
+    max_weight = 0.35
+    max_stocks_per_sector = max_weight / passed_df["Sector"].nunique()
     for _, row in passed_df.iterrows():
         sector = row.get("Sector", "Unknown")
-        if sector_counts.get(sector, 0) < 2:  # Max 2 per sector
+        if sector_counts.get(sector, 0) < max_stocks_per_sector:  # Max 2 per sector
             symbols.append(row["Symbol"])
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
-        if len(symbols) >= 10:  # Cap at 10 stocks for optimization
-            break
 
     # Ensure minimum stocks
     if len(symbols) < min_stocks:
@@ -1217,9 +1226,9 @@ def build_optimized_portfolio(
     # Fetch historical data for optimization
     try:
         # Download historical returns
-        print("Fetching 3-year historical data...")
+        print("Fetching 5-year historical data...")
         data = yf.download(
-            symbols, period="3y", progress=False, threads=4, rounding=True
+            symbols, period="5y", progress=False, threads=4, rounding=True
         )["Close"]
 
         if data.empty:
@@ -1431,7 +1440,6 @@ def main():
         print(f"\nTotal: {len(passed_df)} stocks passed all criteria")
 
     # Export to CSV
-    output_file = "screener_results.csv"
     output_file = "screener_results.csv"
     passed_df.to_csv(output_file, index=False)
     print(f"\nFull results exported to: {output_file}")
