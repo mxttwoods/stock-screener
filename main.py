@@ -4,16 +4,21 @@ Based on RULES.md and IDEAS.md methodology
 """
 
 import os
-import yfinance as yf
-from yfinance import EquityQuery
-import pandas as pd
-import numpy as np
-import requests
 import time
+import json
+import warnings
+from datetime import datetime, timedelta
 from typing import Optional
+
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
 from dotenv import load_dotenv
 from openai import OpenAI
-import warnings
+from yfinance import EquityQuery
+from scipy.optimize import minimize
+import yaml
 
 warnings.filterwarnings("ignore")
 
@@ -22,29 +27,117 @@ load_dotenv()
 
 # Alpha Vantage API configuration
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+assert ALPHA_VANTAGE_API_KEY, "ALPHA_VANTAGE_API_KEY not found in environment variables"
 ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 
 # OpenAI API configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+assert OPENAI_API_KEY, "OPENAI_API_KEY not found in environment variables"
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# =============================================================================
-# CONFIGURATION - Thresholds from RULES.md / IDEAS.md
-# =============================================================================
-MCAP_MIN = 25_000_000_000  # $25 billion
-MCAP_MAX = 4_000_000_000_000  # $4 trillion
-PE_MAX = 50.0
-PEG_MAX = 3
-DE_MAX = 100  # More lenient - validate in Stage 2
-ROE_MIN = 0.10  # 10%
-GROWTH_MIN = 0.06  # 6%
-PFCF_MAX = 30.0
-ROIC_MIN = 0.07  # 7%
-CAGR_MIN = 0.06  # 6%
 
-# Buffett/Ackman quality thresholds (lenient for Stage 1, strict in Stage 2)
-GROSS_MARGIN_MIN = 0.35  # 35% - moat indicator (Buffett prefers 40%+)
-OPERATING_MARGIN_MIN = 0.15  # 15% - efficiency indicator
+# =============================================================================
+# CONFIGURATION - Load from config.yaml
+# =============================================================================
+def load_config():
+    try:
+        with open("config.yaml", "r") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading config.yaml: {e}")
+        raise
+
+
+CONFIG = load_config()
+
+# Extract thresholds for easy access
+MCAP_MIN = CONFIG["market_cap"]["min"]
+MCAP_MAX = CONFIG["market_cap"]["max"]
+
+PE_MAX = CONFIG["valuation"]["pe_max"]
+PEG_MAX = CONFIG["valuation"]["peg_max"]
+PFCF_MAX = CONFIG["valuation"]["pfcf_max"]
+
+# Stage 1 Constants (API expects Percentages)
+GROWTH_MIN_PCT = CONFIG["growth"]["revenue_growth_min_pct"]
+ROIC_MIN_PCT = CONFIG["profitability"]["roic_min_pct"]
+ROE_MIN_PCT = CONFIG["profitability"]["roe_min_pct"]
+ROA_MIN_PCT = CONFIG["profitability"]["roa_min_pct"]
+GROSS_MARGIN_MIN_PCT = CONFIG["profitability"]["gross_margin_min_pct"]
+OPERATING_MARGIN_MIN_PCT = CONFIG["profitability"]["operating_margin_min_pct"]
+CURRENT_RATIO_MAX_PCT = CONFIG["balance_sheet"]["current_ratio_max"]
+BETA_MAX = CONFIG["beta"]["max"]
+BETA_MIN = CONFIG["beta"]["min"]
+
+# Stage 2 Constants (Calculations use Decimals)
+GROWTH_MIN = GROWTH_MIN_PCT / 100.0
+ROIC_MIN = ROIC_MIN_PCT / 100.0
+ROE_MIN = ROE_MIN_PCT / 100.0
+ROA_MIN = ROA_MIN_PCT / 100.0
+GROSS_MARGIN_MIN = GROSS_MARGIN_MIN_PCT / 100.0
+OPERATING_MARGIN_MIN = OPERATING_MARGIN_MIN_PCT / 100.0
+CAGR_MIN = CONFIG["growth"]["cagr_min_pct"] / 100.0
+FIFTYTWOWK_PERCENTCHANGE_MIN = CONFIG["growth"]["fiftytwowk_percentchange_min_pct"]
+FIFTYTWOWK_PERCENTCHANGE_MAX = CONFIG["growth"]["fiftytwowk_percentchange_max_pct"]
+
+DE_MAX = CONFIG["balance_sheet"]["debt_to_equity_max"]
+ACCEPTABLE_RATINGS = CONFIG["analyst"]["acceptable_ratings"]
+
+
+# =============================================================================
+# INDEX MEMBERSHIP HELPER
+# =============================================================================
+# Cache for index holdings (fetched once per run)
+_INDEX_HOLDINGS_CACHE: dict = {}
+
+
+def get_index_holdings(index_symbol: str) -> set:
+    """
+    Fetch top holdings for an index ETF (SPY, QQQ).
+    Returns a set of ticker symbols in the index.
+    Uses caching to avoid repeated API calls.
+    """
+    global _INDEX_HOLDINGS_CACHE
+
+    if index_symbol in _INDEX_HOLDINGS_CACHE:
+        return _INDEX_HOLDINGS_CACHE[index_symbol]
+
+    try:
+        ticker = yf.Ticker(index_symbol)
+        funds_data = ticker.funds_data
+        if funds_data and hasattr(funds_data, "top_holdings"):
+            holdings_df = funds_data.top_holdings
+            if holdings_df is not None and not holdings_df.empty:
+                # Extract ticker symbols from the index
+                symbols = set(holdings_df.index.tolist())
+                _INDEX_HOLDINGS_CACHE[index_symbol] = symbols
+                return symbols
+    except Exception as e:
+        print(f"  Warning: Could not fetch {index_symbol} holdings: {e}")
+
+    _INDEX_HOLDINGS_CACHE[index_symbol] = set()
+    return set()
+
+
+def get_index_membership(symbol: str) -> str:
+    """
+    Check if a stock is in SPY (S&P 500) or QQQ (NASDAQ 100).
+    Returns: "SPY", "QQQ", "SPY/QQQ", or "—"
+    """
+    spy_holdings = get_index_holdings("SPY")
+    qqq_holdings = get_index_holdings("QQQ")
+
+    in_spy = symbol in spy_holdings
+    in_qqq = symbol in qqq_holdings
+
+    if in_spy and in_qqq:
+        return "SPY/QQQ"
+    elif in_spy:
+        return "SPY"
+    elif in_qqq:
+        return "QQQ"
+    else:
+        return "—"
 
 
 # =============================================================================
@@ -133,7 +226,8 @@ def fetch_treasury_yield() -> float:
             latest_yield = float(data["data"][0]["value"])
             return latest_yield / 100
         return 0.045
-    except Exception:
+    except Exception as e:
+        print("ERROR", e)
         return 0.045
 
 
@@ -171,13 +265,18 @@ def fetch_earnings_data(symbol: str) -> dict:
 
         avg_surprise = sum(surprises) / len(surprises) if surprises else None
 
+        last_surprise = None
+        if quarterly and "surprisePercentage" in quarterly[0]:
+            val = quarterly[0]["surprisePercentage"]
+            if val not in [None, "None"]:
+                last_surprise = float(val)
+
         return {
             "Earnings Surprise Avg (%)": avg_surprise,
-            "Last Quarter Surprise (%)": float(quarterly[0]["surprisePercentage"])
-            if quarterly and "surprisePercentage" in quarterly[0]
-            else None,
+            "Last Quarter Surprise (%)": last_surprise,
         }
-    except Exception:
+    except Exception as e:
+        print(f"ERROR in fetch_earnings_data: {e}")
         return {"Earnings Surprise Avg (%)": None, "Last Quarter Surprise (%)": None}
 
 
@@ -213,7 +312,8 @@ def fetch_sentiment_data(symbol: str) -> dict:
                         "News Sentiment Label": ticker_sent["ticker_sentiment_label"],
                     }
         return {"News Sentiment Score": None, "News Sentiment Label": None}
-    except Exception:
+    except Exception as e:
+        print(f"ERROR in fetch_sentiment_data: {e}")
         return {"News Sentiment Score": None, "News Sentiment Label": None}
 
 
@@ -376,16 +476,24 @@ Task:
 1. Synthesize the signals (e.g., "Undervalued by DCF but facing bearish sentiment").
 2. Highlight the primary driver for a BUY or WATCH decision.
 3. Mention the most critical risk.
-4. Be concise (max 80 words). Use numbers."""
+4. Be concise (max 80 words). Use numbers. Be formal, direct, and clear this is financial advice."""
 
         response = openai_client.chat.completions.create(
-            model="gpt-5.1",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.7,
         )
 
-        return response.choices[0].message.content.strip()
+        thesis_text = response.choices[0].message.content.strip()
+        # Sanitize text for PDF generation
+        thesis_text = (
+            thesis_text.replace("’", "'")
+            .replace("“", '"')
+            .replace("”", '"')
+            .replace("—", "--")
+        )
+        return thesis_text
 
     except Exception as e:
         return f"AI thesis error: {str(e)[:50]}"
@@ -415,7 +523,8 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
         try:
             ticker = yf.Ticker(symbol)
             ticker_info = ticker.info
-        except:
+        except Exception as e:
+            print(f"ERROR getting ticker info for {symbol}: {e}")
             ticker_info = {}
 
         # Use pre-calculated conviction score
@@ -435,20 +544,19 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
         # Generate AI thesis
         thesis = generate_ai_thesis(stock_data, ticker_info, conviction, risks)
 
-        advice_data.append(
+        # Create advice row preserving all original data
+        advice_row = stock_data.copy()
+        advice_row.update(
             {
-                "Symbol": symbol,
-                "Name": stock_data.get("Name", "N/A"),
                 "Action": action,
                 "Conviction": conviction,
                 "Conviction Reasons": "; ".join(conviction_reasons),
                 "Risk Warnings": "; ".join(risks) if risks else "None",
                 "AI Thesis": thesis,
-                "Current Price": stock_data.get("Current Price"),
-                "Target Price": stock_data.get("Target Price"),
-                "Graham Number": stock_data.get("Graham Number"),
             }
         )
+
+        advice_data.append(advice_row)
 
         print(f"{action} (Conviction: {conviction}/10)")
 
@@ -468,7 +576,7 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
 
     # Export advice
     advice_df.to_csv("investment_advice.csv", index=False)
-    print(f"\n\nInvestment advice exported to: investment_advice.csv")
+    print("\n\nInvestment advice exported to: investment_advice.csv")
 
     return advice_df
 
@@ -653,20 +761,45 @@ def build_stage1_query() -> EquityQuery:
         # PEG < 3
         EquityQuery("lte", ["pegratio_5y", PEG_MAX]),
         # D/E < 100 (1.0)
-        EquityQuery("btwn", ["totaldebtequity.lasttwelvemonths", 0, DE_MAX]),
+        EquityQuery("btwn", ["totaldebtequity.lasttwelvemonths", 0, (DE_MAX * 100)]),
         # ROE >= 10%
-        EquityQuery("gte", ["returnonequity.lasttwelvemonths", ROE_MIN]),
+        EquityQuery("gte", ["returnonequity.lasttwelvemonths", ROE_MIN_PCT]),
         # ROIC Proxy (Return on Total Capital) >= 7%
-        EquityQuery("gte", ["returnontotalcapital.lasttwelvemonths", ROIC_MIN]),
+        EquityQuery("gte", ["returnontotalcapital.lasttwelvemonths", ROIC_MIN_PCT]),
         # Revenue Growth >= 6%
-        EquityQuery("gte", ["totalrevenues1yrgrowth.lasttwelvemonths", GROWTH_MIN]),
-        EquityQuery("gte", ["quarterlyrevenuegrowth.quarterly", GROWTH_MIN]),
+        EquityQuery("gte", ["totalrevenues1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        EquityQuery("gte", ["quarterlyrevenuegrowth.quarterly", GROWTH_MIN_PCT]),
         # EBITDA Growth >= 6%
-        EquityQuery("gte", ["ebitda1yrgrowth.lasttwelvemonths", GROWTH_MIN]),
+        EquityQuery("gte", ["ebitda1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # Net Income Growth >= 6%
+        EquityQuery("gte", ["netincome1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # Diluted EPS Growth >= 6%
+        EquityQuery("gte", ["dilutedeps1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # Current Ratio >= 1.0 (Liquidity)
+        EquityQuery(
+            "btwn", ["currentratio.lasttwelvemonths", 1, CURRENT_RATIO_MAX_PCT]
+        ),
+        # ROA >= 5% (Efficiency)
+        EquityQuery("gte", ["returnonassets.lasttwelvemonths", ROA_MIN_PCT]),
         # Gross Margin >= 35% (Buffett moat indicator)
-        EquityQuery("gte", ["grossprofitmargin.lasttwelvemonths", GROSS_MARGIN_MIN]),
+        EquityQuery(
+            "gte", ["grossprofitmargin.lasttwelvemonths", GROSS_MARGIN_MIN_PCT]
+        ),
         # Operating Margin >= 15% (efficiency)
-        EquityQuery("gte", ["ebitdamargin.lasttwelvemonths", OPERATING_MARGIN_MIN]),
+        EquityQuery("gte", ["ebitdamargin.lasttwelvemonths", OPERATING_MARGIN_MIN_PCT]),
+        # ROE >= 10%
+        EquityQuery("gte", ["returnonequity.lasttwelvemonths", ROE_MIN_PCT]),
+        # Beta >= 1.0 (Liquidity)
+        EquityQuery("btwn", ["beta", BETA_MIN, BETA_MAX]),
+        # fiftytwowkpercentchange
+        EquityQuery(
+            "btwn",
+            [
+                "fiftytwowkpercentchange",
+                FIFTYTWOWK_PERCENTCHANGE_MIN,
+                FIFTYTWOWK_PERCENTCHANGE_MAX,
+            ],
+        ),
     ]
     return EquityQuery("and", filters)
 
@@ -683,16 +816,30 @@ def run_stage1() -> pd.DataFrame:
     query = build_stage1_query()
 
     try:
-        result = yf.screen(
-            query, size=250, sortField="intradaymarketcap", sortAsc=False
-        )
+        result = yf.screen(query, size=50, sortField="intradaymarketcap", sortAsc=False)
 
         if result is None or "quotes" not in result:
             print("No results from Stage 1 screening")
             return pd.DataFrame()
 
         df = pd.DataFrame(result["quotes"])
-        print(f"Stage 1 found {len(df)} stocks passing initial filters")
+        initial_count = len(df)
+        print(f"Stage 1 found {initial_count} stocks passing initial filters")
+
+        if df.empty:  # Added check for empty DataFrame
+            return pd.DataFrame()
+
+        # Filter out excluded symbols from config
+        excluded_symbols = CONFIG.get("excluded_symbols", [])
+        if excluded_symbols:
+            pre_filter_count = len(df)
+            df = df[~df["symbol"].isin(excluded_symbols)]
+            excluded_count = pre_filter_count - len(df)
+            if excluded_count > 0:
+                print(
+                    f"  Excluded {excluded_count} stocks based on your symbol exclusion list."
+                )
+
         return df
 
     except Exception as e:
@@ -721,7 +868,8 @@ def calculate_pfcf(ticker: yf.Ticker, market_cap: float) -> Optional[float]:
             return None
 
         return market_cap / fcf
-    except Exception:
+    except Exception as e:
+        print(f"ERROR in calculate_pfcf for {ticker.ticker}: {e}")
         return None
 
 
@@ -779,7 +927,8 @@ def calculate_roic(ticker: yf.Ticker) -> Optional[float]:
 
         return nopat / invested_capital
 
-    except Exception:
+    except Exception as e:
+        print(f"ERROR in calculate_roic for {ticker.ticker}: {e}")
         return None
 
 
@@ -799,7 +948,8 @@ def calculate_cagr(values: list, years: int = 3) -> Optional[float]:
 
         cagr = (end_value / start_value) ** (1 / years) - 1
         return cagr
-    except Exception:
+    except Exception as e:
+        print(f"ERROR in calculate_cagr: {e}")
         return None
 
 
@@ -819,7 +969,8 @@ def calculate_graham_number(eps: float, book_value_per_share: float) -> Optional
 
         graham_number = (22.5 * eps * book_value_per_share) ** 0.5
         return graham_number
-    except Exception:
+    except Exception as e:
+        print(f"ERROR in calculate_graham_number: {e}")
         return None
 
 
@@ -845,13 +996,28 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     for i, symbol in enumerate(tickers):
         print(f"  Analyzing {symbol} ({i + 1}/{len(tickers)})...", end=" ")
 
+        result_row = {
+            "Symbol": symbol,
+            "Stage 2 Pass": False,
+            "Failure Reason": "Unknown",
+        }  # Initialize for error cases
+
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
 
+            # Apply excluded_sectors filter here
+            current_sector = info.get("sector")
+            excluded_sectors = CONFIG.get("excluded_sectors", [])
+            if current_sector and current_sector in excluded_sectors:
+                print(f"SKIP (Excluded Sector: {current_sector})")
+                continue
+
             market_cap = info.get("marketCap", 0)
             if not market_cap:
                 print("SKIP (no market cap)")
+                result_row["Failure Reason"] = "No market cap"
+                results.append(result_row)
                 continue
 
             # Calculate P/FCF
@@ -930,17 +1096,13 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
 
             # D/E Filter (Stage 2 validation)
             de_ratio = info.get("debtToEquity", None)
-            if de_ratio is not None and de_ratio > DE_MAX:  # 100 = 1.0 ratio
+            if (
+                de_ratio is not None and de_ratio > DE_MAX * 100
+            ):  # yfinance returns D/E as percentage (e.g. 150 for 1.5)
                 passed = False
                 fail_reasons.append(f"D/E={de_ratio:.1f}")
 
-            if analyst_rating not in [
-                "buy",
-                "strong_buy",
-                "outperform",
-                "none",
-                # "hold",
-            ]:
+            if analyst_rating not in ACCEPTABLE_RATINGS:
                 passed = False
                 fail_reasons.append(f"Analyst Rating={analyst_rating}")
 
@@ -955,6 +1117,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 "Symbol": symbol,
                 "Name": info.get("shortName", "N/A"),
                 "Sector": info.get("sector", "N/A"),
+                "Index": get_index_membership(symbol),  # SPY, QQQ, SPY/QQQ, or —
                 "Market Cap ($B)": market_cap / 1e9,
                 "P/E": info.get("trailingPE", None),
                 "PEG": info.get("pegRatio", None),
@@ -1055,7 +1218,9 @@ def build_optimized_portfolio(
     try:
         # Download historical returns
         print("Fetching 3-year historical data...")
-        data = yf.download(symbols, period="3y", progress=False)["Close"]
+        data = yf.download(
+            symbols, period="3y", progress=False, threads=4, rounding=True
+        )["Close"]
 
         if data.empty:
             print("Could not fetch historical data. Using equal weight.")
@@ -1072,37 +1237,47 @@ def build_optimized_portfolio(
         mean_returns = returns.mean() * 252  # Annualize
         cov_matrix = returns.cov() * 252  # Annualize
 
+        # Regularize the covariance matrix for stability
+        cov_matrix_reg = cov_matrix + np.identity(len(symbols)) * 1e-6
+
         # Optimize for Sharpe ratio with constraints
         n_assets = len(symbols)
-        risk_free_rate = 0.045  # Current T-bill rate ~4.5%
+        risk_free_rate = fetch_treasury_yield()
+        print(f"  Using Risk-Free Rate for optimization: {risk_free_rate * 100:.2f}%")
 
-        # Simple optimization: iterative approach with constraints
-        best_sharpe = -np.inf
-        best_weights = np.array([1 / n_assets] * n_assets)  # Start with equal weight
+        # Optimize for Sharpe ratio using scipy.optimize
+        def negative_sharpe(weights, mean_returns, cov_matrix, risk_free_rate):
+            p_ret = np.dot(weights, mean_returns)
+            p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            # Handle cases where volatility is zero or near-zero
+            if p_vol < 1e-9:
+                return np.inf
+            return -(p_ret - risk_free_rate) / p_vol
 
-        # Monte Carlo simulation for optimization
-        n_portfolios = 10000
-        for _ in range(n_portfolios):
-            # Generate random weights
-            weights = np.random.random(n_assets)
-            weights = weights / weights.sum()  # Normalize to 1
+        # Constraints: sum of weights = 1
+        constraints = {"type": "eq", "fun": lambda x: np.sum(x) - 1}
+        # Bounds: 0 <= weight <= max_weight
+        bounds = tuple((0, max_weight) for _ in range(n_assets))
 
-            # Apply max weight constraint
-            while np.max(weights) > max_weight:
-                excess = weights - max_weight
-                excess[excess < 0] = 0
-                weights = weights - excess
-                weights = weights / weights.sum()
+        print("Optimizing for Sharpe ratio (scipy)...")
+        result = minimize(
+            negative_sharpe,
+            n_assets * [1.0 / n_assets],  # Initial guess: equal weights
+            args=(mean_returns, cov_matrix_reg, risk_free_rate),
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+        )
 
-            # Calculate portfolio metrics
-            port_return = np.dot(weights, mean_returns)
-            port_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-            sharpe = (port_return - risk_free_rate) / port_volatility
+        if result.success:
+            best_weights = result.x
+            best_sharpe = -result.fun
+        else:
+            print(f"Optimization failed: {result.message}. Using equal weights.")
+            best_weights = np.array([1 / n_assets] * n_assets)
+            best_sharpe = 0
 
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_weights = weights.copy()
-
+        print("Optimization complete.")
         # Build result dataframe
         portfolio_df = pd.DataFrame(
             {
@@ -1126,9 +1301,9 @@ def build_optimized_portfolio(
             np.sqrt(np.dot(best_weights.T, np.dot(cov_matrix, best_weights))) * 100
         )
 
-        print(f"\nOptimized Portfolio:")
+        print("\nOptimized Portfolio:")
         print(portfolio_df.to_string(index=False))
-        print(f"\nPortfolio Metrics:")
+        print("\nPortfolio Metrics:")
         print(f"  Expected Annual Return: {port_return:.1f}%")
         print(f"  Expected Volatility: {port_volatility:.1f}%")
         print(f"  Sharpe Ratio: {best_sharpe:.2f}")
@@ -1136,7 +1311,7 @@ def build_optimized_portfolio(
 
         # Export portfolio
         portfolio_df.to_csv("portfolio_allocation.csv", index=False)
-        print(f"\nPortfolio exported to: portfolio_allocation.csv")
+        print("\nPortfolio exported to: portfolio_allocation.csv")
 
         return portfolio_df
 
@@ -1174,12 +1349,12 @@ def _build_fallback_portfolio(passed_df: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
-    print(f"\nFallback Portfolio (Equal Weight):")
+    print("\nFallback Portfolio (Equal Weight):")
     print(portfolio_df.to_string(index=False))
 
     # Export
     portfolio_df.to_csv("portfolio_allocation.csv", index=False)
-    print(f"\nPortfolio exported to: portfolio_allocation.csv")
+    print("\nPortfolio exported to: portfolio_allocation.csv")
 
     return portfolio_df
 
@@ -1206,6 +1381,7 @@ def _build_equal_weight_portfolio(symbols: list) -> pd.DataFrame:
 
 
 def main():
+    start_time = time.time()
     """Main entry point for the GARP stock screener."""
     print("\n" + "=" * 60)
     print("       GARP STOCK SCREENER - Two-Stage Implementation")
@@ -1261,11 +1437,23 @@ def main():
     print(f"\nFull results exported to: {output_file}")
 
     # Build optimized portfolio from passing stocks
+    portfolio_df = pd.DataFrame()
     if not passed_df.empty:
-        build_optimized_portfolio(passed_df)
+        portfolio_df = build_optimized_portfolio(passed_df)
 
         # Generate AI-powered investment advice
-        generate_investment_advice(passed_df)
+        advice_df = generate_investment_advice(passed_df)
+
+        # Generate Professional PDF Report
+        from report_generator import generate_pdf_report
+
+        # Get risk free rate again or pass it down (it was calculated in run_stage2 but local scope)
+        # We'll fetch it again or use default
+        rf_rate = fetch_treasury_yield()
+        generate_pdf_report(advice_df, portfolio_df, rf_rate)
+    end_time = time.time()
+    elapsed_time = timedelta(seconds=end_time - start_time)
+    print(f"\nTotal runtime: {elapsed_time}")
 
 
 if __name__ == "__main__":
