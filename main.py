@@ -1130,7 +1130,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 "Index": get_index_membership(symbol),  # SPY, QQQ, SPY/QQQ, or —
                 "Market Cap ($B)": market_cap / 1e9,
                 "P/E": info.get("trailingPE", None),
-                "PEG": info.get("pegRatio", None),
+                "PEG": av_metrics.get("AV PEG", None),
                 "D/E": info.get("debtToEquity", None),
                 "ROE (%)": (info.get("returnOnEquity", 0) or 0) * 100,
                 "Gross Margin (%)": (info.get("grossMargins", 0) or 0) * 100,
@@ -1185,7 +1185,7 @@ def build_optimized_portfolio(
     Build a Sharpe-optimized portfolio from screener results.
 
     Rules:
-    - Minimum 4 stocks for diversification
+    - Minimum 6 stocks for diversification
     - Maximum 15% in any single name
     - Sector diversification (max 2 per sector initially)
     - Fallback: equal weight with BIL (T-bills) and TLT (20yr bonds) if < 4 stocks
@@ -1204,8 +1204,9 @@ def build_optimized_portfolio(
     # Apply sector diversification - max 2 stocks per sector initially
     symbols = []
     sector_counts = {}
-    max_weight = 0.35
-    max_stocks_per_sector = max_weight / passed_df["Sector"].nunique()
+    max_sector_weight = max_weight
+    max_stocks_per_sector = max_sector_weight / passed_df["Sector"].nunique()
+    passed_df = passed_df.sort_values(by="Market Cap ($B)", ascending=False)
     for _, row in passed_df.iterrows():
         sector = row.get("Sector", "Unknown")
         if sector_counts.get(sector, 0) < max_stocks_per_sector:  # Max 2 per sector
@@ -1266,7 +1267,7 @@ def build_optimized_portfolio(
         # Constraints: sum of weights = 1
         constraints = {"type": "eq", "fun": lambda x: np.sum(x) - 1}
         # Bounds: 0 <= weight <= max_weight
-        bounds = tuple((0, max_weight) for _ in range(n_assets))
+        bounds = tuple((0.02, max_weight) for _ in range(n_assets))
 
         print("Optimizing for Sharpe ratio (scipy)...")
         result = minimize(

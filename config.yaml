@@ -7,7 +7,7 @@ beta:
 valuation:
   pe_max: 50.0
   peg_max: 3.0
-  pfcf_max: 60.0
+  pfcf_max: 75.0
 profitability:
   roe_min_pct: 6.0 # 10
   roa_min_pct: 5.0
