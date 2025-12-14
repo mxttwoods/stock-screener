@@ -12,7 +12,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -24,11 +23,6 @@ warnings.filterwarnings("ignore")
 
 # Load environment variables from .env file
 load_dotenv()
-
-# Alpha Vantage API configuration
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-assert ALPHA_VANTAGE_API_KEY, "ALPHA_VANTAGE_API_KEY not found in environment variables"
-ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 
 # OpenAI API configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -140,181 +134,633 @@ def get_index_membership(symbol: str) -> str:
         return "—"
 
 
-# =============================================================================
-# ALPHA VANTAGE API FUNCTIONS
-# =============================================================================
-def fetch_alpha_vantage_overview(symbol: str) -> Optional[dict]:
+SECTOR_ETF_MAP = {
+    "Communication Services": "XLC",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Energy": "XLE",
+    "Financial Services": "XLF",
+    "Healthcare": "XLV",
+    "Industrials": "XLI",
+    "Real Estate": "XLRE",
+    "Technology": "XLK",
+    "Utilities": "XLU",
+    "Basic Materials": "XLB",
+}
+_SECTOR_METRICS_CACHE = {}
+
+
+def get_sector_median_metrics(sector: str) -> dict:
     """
-    Fetch company fundamental data from Alpha Vantage.
-    Returns key metrics like forward P/E, PEG, analyst targets, etc.
+    Calculate median P/E, P/S, PB, and ROE for a given sector.
+    Uses a corresponding sector ETF to find peer companies.
+    Caches results to avoid redundant calculations.
     """
-    if not ALPHA_VANTAGE_API_KEY:
-        return None
+    global _SECTOR_METRICS_CACHE
+    if sector in _SECTOR_METRICS_CACHE:
+        return _SECTOR_METRICS_CACHE[sector]
 
-    try:
-        params = {
-            "function": "OVERVIEW",
-            "symbol": symbol,
-            "apikey": ALPHA_VANTAGE_API_KEY,
-        }
-        response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
-        data = response.json()
-
-        # Check for API limit or error
-        if "Note" in data or "Error Message" in data or not data:
-            return None
-
-        return data
-    except Exception:
-        return None
-
-
-def get_alpha_vantage_metrics(av_data: Optional[dict]) -> dict:
-    """
-    Extract useful metrics from Alpha Vantage company overview.
-    Returns dict with forward P/E, PEG, analyst target, etc.
-    """
-    if not av_data:
+    etf_ticker = SECTOR_ETF_MAP.get(sector)
+    if not etf_ticker:
         return {}
 
-    def safe_float(value):
-        try:
-            if value in [None, "None", "-", ""]:
-                return None
-            return float(value)
-        except (ValueError, TypeError):
-            return None
+    print(f"  Calculating medians for {sector} sector using {etf_ticker} holdings...")
+    try:
+        etf = yf.Ticker(etf_ticker)
+        # Fix: Use funds_data.top_holdings as .holdings is deprecated/unreliable
+        peers = []
+        if (
+            hasattr(etf, "funds_data")
+            and etf.funds_data
+            and hasattr(etf.funds_data, "top_holdings")
+        ):
+            # funds_data.top_holdings is a DataFrame with Index as tickers
+            if etf.funds_data.top_holdings is not None:
+                peers = etf.funds_data.top_holdings.index.tolist()
+        elif (
+            hasattr(etf, "holdings")
+            and etf.holdings is not None
+            and not etf.holdings.empty
+        ):
+            peers = etf.holdings.index.tolist()
 
-    return {
-        "AV Forward P/E": safe_float(av_data.get("ForwardPE")),
-        "AV PEG": safe_float(av_data.get("PEGRatio")),
-        "AV Analyst Target": safe_float(av_data.get("AnalystTargetPrice")),
-        "AV 52W High": safe_float(av_data.get("52WeekHigh")),
-        "AV 52W Low": safe_float(av_data.get("52WeekLow")),
-        "AV Beta": safe_float(av_data.get("Beta")),
-        "AV Profit Margin": safe_float(av_data.get("ProfitMargin")),
-        "AV Operating Margin": safe_float(av_data.get("OperatingMarginTTM")),
-        "AV Quarterly Earnings Growth": safe_float(
-            av_data.get("QuarterlyEarningsGrowthYOY")
-        ),
-        "AV Quarterly Revenue Growth": safe_float(
-            av_data.get("QuarterlyRevenueGrowthYOY")
-        ),
-    }
+        if not peers:
+            print(f"  Warning: No peers found for {sector} via {etf_ticker}")
+            return {}
+
+        # Get top 20 holdings' tickers
+        peer_symbols = peers[:20]
+        # print(f"  Found {len(peer_symbols)} peers for {sector}") # Debug
+
+        # Fetch info for all peers at once
+        peers = yf.Tickers(peer_symbols)
+        metrics = {
+            "P/E": [],
+            "P/S": [],
+            "P/B": [],
+            "ROE": [],
+        }
+
+        for symbol in peers.tickers:
+            try:
+                info = symbol.info
+                if info.get("trailingPE"):
+                    metrics["P/E"].append(info["trailingPE"])
+                if info.get("priceToSalesTrailing12Months"):
+                    metrics["P/S"].append(info["priceToSalesTrailing12Months"])
+                if info.get("priceToBook"):
+                    metrics["P/B"].append(info["priceToBook"])
+                if info.get("returnOnEquity"):
+                    metrics["ROE"].append(info["returnOnEquity"])
+            except Exception:
+                continue  # Ignore tickers that fail to load
+
+        # Calculate medians, ignoring empty lists
+        median_metrics = {}
+        for key, values in metrics.items():
+            if values:
+                median_metrics[f"Sector Median {key}"] = np.nanmedian(
+                    [v for v in values if v is not None]
+                )
+
+        _SECTOR_METRICS_CACHE[sector] = median_metrics
+        return median_metrics
+
+    except Exception as e:
+        print(f"  Warning: Could not calculate sector medians for {sector}: {e}")
+        return {}
 
 
+# =============================================================================
+# DATA FETCHING HELPER FUNCTIONS (YFINANCE)
+# =============================================================================
 def fetch_treasury_yield() -> float:
     """
-    Fetch the latest 10-year Treasury yield from Alpha Vantage.
+    Fetch the latest 10-year Treasury yield using yfinance (^TNX).
     Returns yield as a decimal (e.g., 0.045 for 4.5%).
-    Default fallback: 0.045 (4.5%)
     """
-    if not ALPHA_VANTAGE_API_KEY:
-        return 0.045
-
     try:
-        params = {
-            "function": "TREASURY_YIELD",
-            "interval": "daily",
-            "maturity": "10year",
-            "apikey": ALPHA_VANTAGE_API_KEY,
-        }
-        response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
-        data = response.json()
-
-        if "data" in data and len(data["data"]) > 0:
-            latest_yield = float(data["data"][0]["value"])
-            return latest_yield / 100
+        ticker = yf.Ticker("^TNX")
+        # TNX price is the yield multiplied by 10 (e.g. 45.0 = 4.5%)
+        # But actually Yahoo quotes it as the rate directly (e.g. 4.5)
+        # Let's check history to be safe
+        hist = ticker.history(period="5d")
+        if not hist.empty:
+            latest_yield = hist["Close"].iloc[-1]
+            return float(latest_yield) / 100.0
         return 0.045
     except Exception as e:
-        print("ERROR", e)
+        print(f"Warning: Could not fetch ^TNX: {e}")
         return 0.045
 
 
-def fetch_earnings_data(symbol: str) -> dict:
+def fetch_earnings_surprise(ticker: yf.Ticker) -> dict:
     """
-    Fetch earnings data (surprises, estimates) from Alpha Vantage.
+    Calculate earnings surprise from yfinance data.
     """
-    if not ALPHA_VANTAGE_API_KEY:
-        return {"Earnings Surprise Avg (%)": None, "Last Quarter Surprise (%)": None}
-
     try:
-        params = {
-            "function": "EARNINGS",
-            "symbol": symbol,
-            "apikey": ALPHA_VANTAGE_API_KEY,
-        }
-        response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
-        data = response.json()
-
-        quarterly = data.get("quarterlyEarnings", [])
-        if not quarterly:
+        # yfinance often has earnings_history
+        # It returns a DataFrame with 'EPS Estimate', 'Reported EPS', 'Surprise(%)'
+        earnings = ticker.earnings_history
+        if earnings is None or earnings.empty:
             return {
                 "Earnings Surprise Avg (%)": None,
                 "Last Quarter Surprise (%)": None,
             }
 
-        # Calculate average surprise over last 4 quarters
-        surprises = []
-        for q in quarterly[:4]:
-            if "surprisePercentage" in q and q["surprisePercentage"] not in [
-                None,
-                "None",
-            ]:
-                surprises.append(float(q["surprisePercentage"]))
+        # Ensure numeric columns
+        if "Surprise(%)" in earnings.columns:
+            surprises = pd.to_numeric(earnings["Surprise(%)"], errors="coerce").dropna()
 
-        avg_surprise = sum(surprises) / len(surprises) if surprises else None
+            if surprises.empty:
+                return {
+                    "Earnings Surprise Avg (%)": None,
+                    "Last Quarter Surprise (%)": None,
+                }
 
-        last_surprise = None
-        if quarterly and "surprisePercentage" in quarterly[0]:
-            val = quarterly[0]["surprisePercentage"]
-            if val not in [None, "None"]:
-                last_surprise = float(val)
+            last_surprise = (
+                surprises.iloc[0] * 100
+            )  # usually decimal in DF? No, Yahoo usually sends 0.05 for 5% or 5.0?
+            # Actually yfinance earnings_history usually assumes raw values.
+            # Let's assume it matches what we see in the dataframe.
+            # If the value is 0.05, that's 5%. If it is 5.0, that's 500%? No.
+            # Usually 'Surprise(%)' is e.g. 0.06 meaning 6%.
 
-        return {
-            "Earnings Surprise Avg (%)": avg_surprise,
-            "Last Quarter Surprise (%)": last_surprise,
-        }
+            # Let's assume decimal input if < 1.0 mostly, but safe to just take mean
+            avg = surprises.mean()
+
+            # Formatting: if values are small (like 0.05), return as percentage (5.0)
+            # If they are large (like 5.0), assume they are already percentages?
+            # In yfinance, it's typically a ratio. e.g. 0.03.
+
+            return {
+                "Earnings Surprise Avg (%)": avg * 100,
+                "Last Quarter Surprise (%)": last_surprise * 100,
+            }
+
+        return {"Earnings Surprise Avg (%)": None, "Last Quarter Surprise (%)": None}
+
     except Exception as e:
-        print(f"ERROR in fetch_earnings_data: {e}")
+        # print(f"  Warning: Earnings data error: {e}")
         return {"Earnings Surprise Avg (%)": None, "Last Quarter Surprise (%)": None}
 
 
-def fetch_sentiment_data(symbol: str) -> dict:
+def fetch_insider_sentiment(ticker) -> dict:
     """
-    Fetch news sentiment data from Alpha Vantage.
+    Analyze recent insider transactions (last 6 months).
+    Returns a sentiment label and net share change.
     """
-    if not ALPHA_VANTAGE_API_KEY:
+    try:
+        insider = ticker.insider_transactions
+        if insider is None or insider.empty:
+            return {"Insider Sentiment": "Unknown", "Net Insider Shares": 0}
+
+        # Filter for last 6 months
+        six_months_ago = pd.Timestamp.now() - pd.DateOffset(months=6)
+
+        # Ensure 'Date' column is datetime
+        if "Start Date" in insider.columns:
+            # Clean string dates if necessary
+            insider["Start Date"] = pd.to_datetime(
+                insider["Start Date"], errors="coerce"
+            )
+            recent = insider[insider["Start Date"] > six_months_ago]
+        elif insider.index.name == "Start Date" or isinstance(
+            insider.index, pd.DatetimeIndex
+        ):
+            # Index might be the date
+            pass  # Use recent if index filtering works, but yfinance usually returns a DF with Date column
+            # Double check yfinance structure, usually specific cols
+            recent = (
+                insider  # Fallback if date logic fails for now, or just take top rows
+            )
+        else:
+            # Fallback: just take last 20 rows
+            recent = insider.head(20)
+
+        # Calculate net shares purchased/sold
+        # yfinance columns often: ['Shares', 'Value', 'Text', 'Transaction', 'Start Date', 'Ownership', 'Indicated']
+        # 'Shares' is often just the number involved. Need to check 'Transaction' or 'Text' for Buy/Sell.
+        # Common structure: 'Shares' +/- based on type?
+        # Actually yfinance data is often messy. Let's look at specific pattern.
+        # Simpler proxy: Look at "Net Shares Purchased" if available or infer.
+
+        # Let's try a simpler heuristic for now:
+        # Check if there are more "Buy" (or "Purchase") rows than "Sale" rows in top 10.
+
+        buys = 0
+        sells = 0
+        net_shares = 0
+
+        # 'Text' column usually contains "Sale at price..." or "Purchase at price..."
+        # 'Transaction' might be explicit
+
+        for index, row in recent.iterrows():
+            text = str(row.get("Text", "")).lower()
+            transaction = str(row.get("Transaction", "")).lower()
+            shares = row.get("Shares", 0)
+
+            if "purchase" in text or "buy" in text or "purchase" in transaction:
+                buys += 1
+                net_shares += shares
+            elif "sale" in text or "sell" in text or "sale" in transaction:
+                sells += 1
+                net_shares -= shares
+
+        label = "Neutral"
+        if buys > sells and net_shares > 0:
+            label = "Positive"
+        elif sells > buys and net_shares < 0:
+            label = "Negative"
+
+        return {"Insider Sentiment": label, "Net Insider Shares": net_shares}
+
+    except Exception as e:
+        # print(f"DEBUG: Insider error: {e}")
+        return {"Insider Sentiment": "Unknown", "Net Insider Shares": 0}
+
+
+def fetch_institutional_holdings(ticker) -> dict:
+    """
+    Get top institutional holders and total % held.
+    """
+    try:
+        # ticker.institutional_holders returns a DataFrame with ["Holder", "Shares", "Date Reported", "% Out", "Value"]
+        holders = ticker.institutional_holders
+        major = ticker.major_holders  # Key stats like "% Held by Institutions"
+
+        top_holder = "N/A"
+        pct_held_institutions = 0.0
+
+        if holders is not None and not holders.empty:
+            top_holder = holders.iloc[0].get("Holder", "N/A")
+
+        if major is not None and not major.empty:
+            # major_holders keys are often indices 0, 1 with values in column 0, 1
+            # Row with "% of Float Held by Institutions" or similar
+            # It's often a dictionary-like DF: 0: percentage, 1: description
+            for index, row in major.iterrows():
+                desc = str(row.iloc[1])  # Description column
+                val = str(row.iloc[0])  # Value column
+                if "Institutions" in desc:
+                    # localized string cleans, e.g. "80.50%"
+                    try:
+                        clean_val = val.replace("%", "")
+                        pct_held_institutions = float(clean_val)
+                    except:
+                        pass
+                    break
+
+        return {
+            "Top Institutional Holder": top_holder,
+            "Institutional Ownership (%)": pct_held_institutions,
+        }
+
+    except Exception:
+        return {"Top Institutional Holder": "N/A", "Institutional Ownership (%)": 0.0}
+
+
+def calculate_quality_of_earnings(ticker) -> dict:
+    """
+    Quality of Earnings = Operating Cash Flow / Net Income.
+    Ratio > 1.0 is healthy (cash confirms profits).
+    Ratio < 0.8 is a warning sign.
+    """
+    try:
+        cashflow = ticker.cashflow
+        financials = ticker.financials
+
+        if cashflow.empty or financials.empty:
+            return {
+                "Quality of Earnings Ratio": None,
+                "Earnings Quality Concern": False,
+            }
+
+        # Get TTM or latest annual
+        # cashflow.columns are dates. Column 0 is most recent.
+
+        ocf = None
+        net_income = None
+
+        # Try to find Operating Cash Flow
+        # Keys vary: "Operating Cash Flow", "Total Cash From Operating Activities"
+        possible_ocf_keys = [
+            "Operating Cash Flow",
+            "Total Cash From Operating Activities",
+        ]
+        for key in possible_ocf_keys:
+            if key in cashflow.index:
+                ocf = cashflow.loc[key].iloc[0]  # Most recent
+                break
+
+        # Try to find Net Income
+        # Keys vary: "Net Income", "Net Income Common Stockholders"
+        possible_ni_keys = [
+            "Net Income",
+            "Net Income Common Stockholders",
+            "Net Income From Continuing And Discontinued Operation",
+        ]
+        for key in possible_ni_keys:
+            if key in financials.index:
+                net_income = financials.loc[key].iloc[0]
+                break
+
+        if ocf is not None and net_income is not None and net_income != 0:
+            ratio = ocf / net_income
+            concern = ratio < 0.8
+            return {
+                "Quality of Earnings Ratio": ratio,
+                "Earnings Quality Concern": concern,
+            }
+
+        return {"Quality of Earnings Ratio": None, "Earnings Quality Concern": False}
+
+    except Exception as e:
+        return {"Quality of Earnings Ratio": None, "Earnings Quality Concern": False}
+
+
+def calculate_peg_ratio(ticker, info: dict) -> dict:
+    """
+    Calculate PEG Ratio (Price/Earnings-to-Growth).
+    Uses Forward P/E and Next 5Y Growth estimates if available.
+    """
+    try:
+        # P/E to use: Forward Preferred, Trailing Fallback
+        pe = info.get("forwardPE") or info.get("trailingPE")
+
+        # Growth Rate: Try to get 5Y est, or next year est
+        # We need a robust growth number. yfinance often has 'pegRatio' directly.
+
+        # Method 1: Direct from info (most reliable if available)
+        if info.get("pegRatio"):
+            return {"PEG Ratio": info.get("pegRatio")}
+
+        # Method 2: Manual Calculation
+        growth_est = fetch_growth_estimates(ticker).get("Next Year Growth Est (%)")
+        if pe and growth_est and growth_est > 0:
+            peg = pe / growth_est
+            return {"PEG Ratio": round(peg, 2)}
+
+        return {"PEG Ratio": None}
+    except Exception:
+        return {"PEG Ratio": None}
+
+
+def fetch_rsi(ticker, period=14) -> dict:
+    """
+    Calculate 14-day RSI (Relative Strength Index).
+    Returns RSI value and signal (Oversold/Overbought).
+    """
+    try:
+        hist = ticker.history(period="3mo")  # Need enough data for 14d + smoothing
+        if hist.empty or len(hist) < period + 1:
+            return {"RSI": None, "RSI Signal": "Insufficient Data"}
+
+        close = hist["Close"]
+        delta = close.diff()
+
+        # Gain/Loss
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+        # Calculate RS
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs)).iloc[-1]  # Most recent RSI
+
+        signal = "Neutral"
+        if rsi < 30:
+            signal = "Oversold (Buy Dip)"
+        elif rsi > 70:
+            signal = "Overbought (Risk)"
+
+        return {"RSI": round(rsi, 2), "RSI Signal": signal}
+    except Exception:
+        return {"RSI": None, "RSI Signal": "Error"}
+
+
+def fetch_growth_estimates(ticker) -> dict:
+    """
+    Fetch "Next Year" growth estimates from yfinance.
+    Returns dictionary with growth percentage.
+    """
+    try:
+        # ticker.earnings_estimate is a DataFrame with Index=['0q','+1q','0y','+1y']
+        # Columns: ['avg', 'low', 'high', 'yearAgoEps', 'numberOfAnalysts', 'growth']
+        est = ticker.earnings_estimate
+        if est is not None and not est.empty and "+1y" in est.index:
+            growth = est.loc["+1y", "growth"]
+            return {"Next Year Growth Est (%)": round(growth * 100, 2)}
+        return {"Next Year Growth Est (%)": None}
+    except Exception:
+        return {"Next Year Growth Est (%)": None}
+
+
+def fetch_eps_revisions(ticker) -> dict:
+    """
+    Analyze EPS revisions (Up vs Down) for the last 30 days.
+    Returns Up/Down ratio and raw counts.
+    """
+    try:
+        # ticker.eps_revisions index=['0q','+1q','0y','+1y']
+        # Columns: ['upLast7days', 'upLast30days', 'downLast30days', 'downLast7Days']
+        rev = ticker.eps_revisions
+        if rev is not None and not rev.empty:
+            # Aggregate revisions for current/next quarter/year
+            up_30d = rev["upLast30days"].sum()
+            down_30d = rev["downLast30days"].sum()
+
+            ratio = up_30d / down_30d if down_30d > 0 else (up_30d if up_30d > 0 else 0)
+
+            return {
+                "EPS Revisions Up (30d)": int(up_30d),
+                "EPS Revisions Down (30d)": int(down_30d),
+                "EPS Up/Down Ratio": round(ratio, 2),
+            }
+        return {
+            "EPS Revisions Up (30d)": 0,
+            "EPS Revisions Down (30d)": 0,
+            "EPS Up/Down Ratio": 0.0,
+        }
+    except Exception:
+        return {
+            "EPS Revisions Up (30d)": 0,
+            "EPS Revisions Down (30d)": 0,
+            "EPS Up/Down Ratio": 0.0,
+        }
+
+
+def fetch_analyst_recommendations(ticker) -> dict:
+    """
+    Analyze recent analyst recommendations trend (last 3 months).
+    Returns trend signal (Positive/Neutral/Negative).
+    """
+    try:
+        # ticker.recommendations is a DataFrame: period, strongBuy, buy, hold, sell, strongSell
+        # Rows usually: 0 (-0m), 1 (-1m), 2 (-2m), 3 (-3m) - backwards in time?
+        # Actually in inspection it was 0m, -1m, -2m, -3m
+        recs = ticker.recommendations
+        if recs is not None and not recs.empty:
+            # Current month (row 0 typically, or confirm by 'period' col)
+            current = recs.iloc[0]  # 0m
+            three_mo_ago = recs.iloc[-1]  # -3m if available, or just verify period
+
+            # Simple summation of Bullish (Strong Buy + Buy) vs Bearish (Sell + Strong Sell)
+            # Compare current month vs 3 months ago to see trend
+
+            curr_bullish = current["strongBuy"] + current["buy"]
+            prev_bullish = three_mo_ago["strongBuy"] + three_mo_ago["buy"]
+
+            trend = "Neutral"
+            if curr_bullish > prev_bullish:
+                trend = "Improving"
+            elif curr_bullish < prev_bullish:
+                trend = "Softening"
+
+            return {"Analyst Trend": trend, "Current Buy Ratings": int(curr_bullish)}
+
+        return {"Analyst Trend": "Unknown", "Current Buy Ratings": 0}
+    except Exception:
+        return {"Analyst Trend": "Unknown", "Current Buy Ratings": 0}
+
+
+def fetch_technical_signals(ticker) -> dict:
+    """
+    Calculate simple technical indicators (SMA50, SMA200) from 1y history.
+    """
+    try:
+        # Get 1 year of history
+        hist = ticker.history(period="1y")
+        if hist.empty or len(hist) < 200:
+            return {
+                "SMA50": None,
+                "SMA200": None,
+                "Technical Signal": "Insufficient Data",
+            }
+
+        # Calculate SMAs
+        sma50 = hist["Close"].rolling(window=50).mean().iloc[-1]
+        sma200 = hist["Close"].rolling(window=200).mean().iloc[-1]
+        current_price = hist["Close"].iloc[-1]
+
+        signal = "Neutral"
+        if sma50 > sma200:
+            signal = "Golden Cross (Bullish)"
+        elif sma50 < sma200:
+            signal = "Death Cross (Bearish)"
+
+        # Price vs SMA trend
+        trend = "Uptrend" if current_price > sma200 else "Downtrend"
+
+        return {
+            "SMA50": sma50,
+            "SMA200": sma200,
+            "Technical Signal": signal,
+            "Price Trend": trend,
+        }
+    except Exception:
+        return {
+            "SMA50": None,
+            "SMA200": None,
+            "Technical Signal": "Error",
+            "Price Trend": "Unknown",
+        }
+
+
+def check_earnings_calendar(ticker) -> dict:
+    """
+    Check if earnings are upcoming in the next 7 days.
+    """
+    try:
+        cal = ticker.calendar
+        # Calendar format varies. Often a dict or DataFrame.
+        # usually: {'Earnings Date': [datetime.date(2025, 1, 23)], ...}
+        # or DataFrame with columns.
+
+        upcoming = False
+        days_to_earnings = None
+
+        if cal is not None:
+            # Handle different formats (Dict vs DataFrame)
+            dates = []
+            if isinstance(cal, dict):
+                if "Earnings Date" in cal:
+                    dates = cal["Earnings Date"]
+                elif "Earnings High" in cal:  # Sometimes structure is different
+                    pass
+            elif isinstance(cal, pd.DataFrame):
+                if "Earnings Date" in cal.index:  # Transposed sometimes
+                    dates = cal.loc["Earnings Date"].tolist()
+                elif "Earnings Date" in cal.columns:
+                    dates = cal["Earnings Date"].tolist()
+
+            # If we found dates, check proximity
+            if dates:
+                # Flatten if list of lists
+                if isinstance(dates[0], list):
+                    dates = [item for sublist in dates for item in sublist]
+
+                now = pd.Timestamp.now().date()
+                for d in dates:
+                    # Convert to date if timestamp
+                    if isinstance(d, pd.Timestamp):
+                        d = d.date()
+
+                    if d >= now:
+                        delta = (d - now).days
+                        if delta <= 7:
+                            upcoming = True
+                            days_to_earnings = delta
+                            break
+
+        return {"Upcoming Earnings": upcoming, "Days to Earnings": days_to_earnings}
+
+    except Exception:
+        return {"Upcoming Earnings": False, "Days to Earnings": None}
+
+
+def analyze_sentiment_with_ai(symbol: str, ticker: yf.Ticker) -> dict:
+    """
+    Analyze news sentiment using OpenAI on yfinance news titles.
+    """
+    if not openai_client:
         return {"News Sentiment Score": None, "News Sentiment Label": None}
 
     try:
-        params = {
-            "function": "NEWS_SENTIMENT",
-            "tickers": symbol,
-            "limit": 1,
-            "apikey": ALPHA_VANTAGE_API_KEY,
+        news = ticker.news
+        if not news:
+            return {"News Sentiment Score": None, "News Sentiment Label": None}
+
+        headlines = [n.get("title", "") for n in news[:15]]
+        headlines_text = "\n".join(f"- {h}" for h in headlines)
+
+        prompt = f"""Analyze the sentiment of the following news headlines for {symbol}.
+Headlines:
+{headlines_text}
+
+Return a valid JSON object with exactly two keys:
+"score": A float between -1.0 (Very Bearish) and 1.0 (Very Bullish).
+"label": A string text label (e.g., "Bullish", "Bearish", "Neutral").
+"""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=100,
+            temperature=0.0,
+        )
+
+        result_text = response.choices[0].message.content.strip()
+        result_json = json.loads(result_text)
+
+        return {
+            "News Sentiment Score": result_json.get("score"),
+            "News Sentiment Label": result_json.get("label"),
         }
-        response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
-        data = response.json()
 
-        # Sentiment is often in the feed, but we look for overall ticker sentiment if available
-        # The endpoint returns a feed of articles. We can check the first few for overall sentiment.
-        # For simplicity, we'll look at the first article's sentiment for this ticker.
-
-        if "feed" in data and len(data["feed"]) > 0:
-            article = data["feed"][0]
-            for ticker_sent in article.get("ticker_sentiment", []):
-                if ticker_sent["ticker"] == symbol:
-                    return {
-                        "News Sentiment Score": float(
-                            ticker_sent["ticker_sentiment_score"]
-                        ),
-                        "News Sentiment Label": ticker_sent["ticker_sentiment_label"],
-                    }
-        return {"News Sentiment Score": None, "News Sentiment Label": None}
-    except Exception as e:
-        print(f"ERROR in fetch_sentiment_data: {e}")
-        return {"News Sentiment Score": None, "News Sentiment Label": None}
+    except Exception:
+        # print(f"AI Sentiment Error: {e}")
+        return {"News Sentiment Score": 0, "News Sentiment Label": "Error"}
 
 
 # =============================================================================
@@ -372,9 +818,51 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
         score += 1
         reasons.append(f"Strong growth ({rev_cagr:.1f}% CAGR) ✓")
 
-    # Penalty for high P/E (-1 if > 30)
+    # NEW: Next Year Growth Estimate (+1 if > 15%)
+    next_yr_growth = stock_data.get("Next Year Growth Est (%)", 0) or 0
+    if next_yr_growth > 15:
+        score += 1
+        reasons.append(f"Strong future growth est ({next_yr_growth:.1f}%) ✓")
+
+    # NEW: EPS Revisions (+1 if Ratio > 1.5)
+    rev_ratio = stock_data.get("EPS Up/Down Ratio", 0) or 0
+    if rev_ratio > 1.5:
+        score += 1
+        reasons.append(f"Bullish analyst revisions ({rev_ratio}x Up/Down) ✓")
+
+    # NEW: Analyst Trend (+1 if Improving)
+    analyst_trend = stock_data.get("Analyst Trend", "Neutral")
+    if analyst_trend == "Improving":
+        score += 1
+        reasons.append("Analyst ratings improving ✓")
+
+    # NEW: Technical Signals (+1 for Golden Cross, +1 for Uptrend)
+    tech_signal = stock_data.get("Technical Signal", "Neutral")
+    price_trend = stock_data.get("Price Trend", "Neutral")
+
+    if "Golden Cross" in tech_signal:
+        score += 1
+        reasons.append("Golden Cross (Bullish) ✓")
+
+    if price_trend == "Uptrend":
+        score += 1
+        reasons.append("Price in Uptrend (> SMA200) ✓")
+
+    # NEW: RSI Oversold (Buy Dip)
+    rsi = stock_data.get("RSI", 50) or 50
+    if rsi < 30:
+        score += 1
+        reasons.append(f"Oversold (RSI: {rsi:.0f}) - Buy Dip Opp. ✓")
+
+    # NEW: PEG Ratio (Growth at Reasonable Price)
+    peg = stock_data.get("PEG Ratio", 999) or 999
+    if peg < 1.5:
+        score += 1
+        reasons.append(f"Reasonable Growth Val (PEG: {peg}) ✓")
+
+    # Penalty for high P/E (-1 if > 30), UNLESS PEG is good
     pe = stock_data.get("P/E", 0) or 0
-    if pe > 30:
+    if pe > 30 and peg > 2.0:
         score -= 1
         reasons.append(f"High P/E ({pe:.1f}) ⚠️")
 
@@ -401,14 +889,37 @@ def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
         warnings.append(f"⚠️ High leverage (D/E: {de:.1f})")
 
     # Negative Graham Upside (significantly overvalued)
-    graham_upside = stock_data.get("Graham Upside (%)", 0) or 0
-    if graham_upside < -50:
-        warnings.append(f"⚠️ Significantly above Graham value ({graham_upside:.0f}%)")
+    graham_undervalued = (
+        str(stock_data.get("Graham Undervalued", "False")).lower() == "true"
+    )
+    peg = stock_data.get("PEG Ratio", 999) or 999
+
+    if graham_undervalued:
+        pass  # No warning
+    elif peg < 2.0:
+        pass  # No warning (Justified by growth)
+    else:
+        warnings.append(f"⚠️ Significantly above Graham value")
 
     # Low analyst coverage
     num_analysts = stock_data.get("# Analysts", 0) or 0
     if num_analysts < 5:
         warnings.append(f"⚠️ Low analyst coverage ({num_analysts} analysts)")
+
+    # Technical Warning (Death Cross)
+    tech_signal = stock_data.get("Technical Signal", "Neutral")
+    if "Death Cross" in tech_signal:
+        warnings.append("⚠️ Death Cross (Bearish Trend)")
+
+    # Upcoming Earnings Warning
+    if stock_data.get("Upcoming Earnings", False):
+        days = stock_data.get("Days to Earnings")
+        warnings.append(f"⚠️ Earnings in {days} days (High Volatility)")
+
+    # Technical Warning (RSI Overbought)
+    rsi = stock_data.get("RSI", 50) or 50
+    if rsi > 70:
+        warnings.append(f"⚠️ Overbought (RSI: {rsi:.0f})")
 
     # Bearish Sentiment
     sentiment_label = str(stock_data.get("News Sentiment Label", "")).lower()
@@ -447,6 +958,14 @@ def generate_ai_thesis(
         name = stock_data.get("Name", "Unknown")
         sector = stock_data.get("Sector", "Unknown")
 
+        # Format sector medians for the prompt
+        sector_pe = stock_data.get("Sector Median P/E")
+        sector_roe = stock_data.get("Sector Median ROE")
+        pe_comparison = f"(Sector Median: {sector_pe:.1f})" if sector_pe else ""
+        roe_comparison = (
+            f"(Sector Median: {sector_roe * 100:.1f}%)" if sector_roe else ""
+        )
+
         prompt = f"""You are a Lead Equity Analyst. Synthesize the following data into a compelling 2-3 sentence investment thesis for {symbol} ({name}).
 
 Company Profile:
@@ -455,35 +974,42 @@ Company Profile:
 - Analyst Coverage: {stock_data.get("# Analysts", "N/A")} analysts
 
 Financials & Profitability:
-- P/E: {stock_data.get("P/E", "N/A")} (Forward P/E: {stock_data.get("AV Forward P/E", "N/A")})
+- P/E: {stock_data.get("P/E", "N/A")} {pe_comparison}
 - PEG: {stock_data.get("PEG", "N/A")}
-- ROE: {stock_data.get("ROE (%)", "N/A")}%
+- ROE: {stock_data.get("ROE (%)", "N/A")}% {roe_comparison}
 - ROIC: {stock_data.get("ROIC (%)", "N/A")}%
 - Margins: Gross {stock_data.get("Gross Margin (%)", "N/A")}%, Op {stock_data.get("Op Margin (%)", "N/A")}%
 
 Growth:
 - 3Y Revenue CAGR: {stock_data.get("3Y Rev CAGR (%)", "N/A")}%
+- Next Yr Growth Est: {stock_data.get("Next Year Growth Est (%)", "N/A")}%
 - Quarterly Revenue Growth (YoY): {stock_data.get("AV Quarterly Revenue Growth", "N/A")}%
 - Quarterly Earnings Growth (YoY): {stock_data.get("AV Quarterly Earnings Growth", "N/A")}%
 
 Valuation Models:
 - Graham Number: ${stock_data.get("Graham Number", "N/A")} (Undervalued: {stock_data.get("Graham Undervalued", "N/A")})
+- PEG Ratio: {stock_data.get("PEG Ratio", "N/A")} (Growth Adj. Val)
 - DCF Fair Value: ${stock_data.get("DCF Fair Value", "N/A")} (Upside: {stock_data.get("DCF Upside (%)", "N/A")}%)
 - Analyst Target: ${stock_data.get("Target Price", "N/A")} (Upside: {stock_data.get("Upside (%)", "N/A")}%)
 
 Sentiment & Momentum:
 - Price vs 52W Range: Current ${stock_data.get("Current Price", "N/A")} (Range: ${stock_data.get("AV 52W Low", "N/A")} - ${stock_data.get("AV 52W High", "N/A")})
 - News Sentiment: {stock_data.get("News Sentiment Label", "N/A")} (Score: {stock_data.get("News Sentiment Score", "N/A")})
+- EPS Revisions (30d): {stock_data.get("EPS Up/Down Ratio", "N/A")}x (Up: {stock_data.get("EPS Revisions Up (30d)", 0)} / Down: {stock_data.get("EPS Revisions Down (30d)", 0)})
+- Analyst Trend (3mo): {stock_data.get("Analyst Trend", "N/A")} ({stock_data.get("Current Buy Ratings", 0)} Buys)
 - Earnings Surprise (Avg): {stock_data.get("Earnings Surprise Avg (%)", "N/A")}%
 - Analyst Rating: {stock_data.get("Analyst Rating", "N/A")}
+- Technical Trend: {stock_data.get("Price Trend", "N/A")} (Signal: {stock_data.get("Technical Signal", "N/A")})
+- RSI (14d): {stock_data.get("RSI", "N/A")} (Signal: {stock_data.get("RSI Signal", "N/A")})
 
 Risk Profile:
 - Conviction Score: {conviction_score}/10
 - Identified Risks: {", ".join(risks) if risks else "None"}
 - Debt/Equity: {stock_data.get("D/E", "N/A")}
+- Upcoming Earnings: {"Yes, in " + str(stock_data.get("Days to Earnings")) + " days" if stock_data.get("Upcoming Earnings") else "No"}
 
 Task:
-1. Synthesize the signals (e.g., "Undervalued by DCF but facing bearish sentiment").
+1. Synthesize the signals (e.g., "Trading at a discount to its sector P/E median").
 2. Highlight the primary driver for a BUY or WATCH decision.
 3. Mention the most critical risk.
 4. Be concise (max 80 words). Use numbers. Be formal, direct, and do not provide financial advice."""
@@ -599,12 +1125,7 @@ def calculate_dcf_fair_value(
 ) -> dict:
     """
     Calculate DCF (Discounted Cash Flow) intrinsic value per share.
-
-    DCF Formula:
-    - Project FCF for 5 years using historical growth rate
-    - Calculate terminal value using perpetuity growth model
-    - Discount all cash flows to present value using WACC
-    - Divide by shares outstanding to get fair value per share
+    This version uses a more robust, company-specific WACC.
     """
     try:
         # Get cash flow statement
@@ -616,21 +1137,9 @@ def calculate_dcf_fair_value(
                 "DCF Notes": "No cash flow data",
             }
 
-        # Get Free Cash Flow (Operating CF - CapEx)
-        operating_cf = None
-        capex = None
-
-        if "Operating Cash Flow" in cf.index:
-            operating_cf = cf.loc["Operating Cash Flow"].dropna().tolist()
-        elif "Total Cash From Operating Activities" in cf.index:
-            operating_cf = (
-                cf.loc["Total Cash From Operating Activities"].dropna().tolist()
-            )
-
-        if "Capital Expenditure" in cf.index:
-            capex = cf.loc["Capital Expenditure"].dropna().tolist()
-        elif "Capital Expenditures" in cf.index:
-            capex = cf.loc["Capital Expenditures"].dropna().tolist()
+        # Get Free Cash Flow
+        operating_cf = cf.loc["Total Cash From Operating Activities"].dropna().tolist()
+        capex = cf.loc["Capital Expenditure"].dropna().tolist()
 
         if not operating_cf or not capex or len(operating_cf) < 2:
             return {
@@ -639,9 +1148,7 @@ def calculate_dcf_fair_value(
                 "DCF Notes": "Insufficient FCF data",
             }
 
-        # Calculate current FCF (most recent year)
-        current_fcf = operating_cf[0] + capex[0]  # capex is typically negative
-
+        current_fcf = operating_cf[0] + capex[0]
         if current_fcf <= 0:
             return {
                 "DCF Fair Value": None,
@@ -649,96 +1156,97 @@ def calculate_dcf_fair_value(
                 "DCF Notes": "Negative FCF",
             }
 
-        # Estimate FCF growth rate from historical data
+        # FCF growth rate
         if len(operating_cf) >= 3:
             older_fcf = operating_cf[2] + (capex[2] if len(capex) > 2 else 0)
-            if older_fcf > 0:
-                fcf_growth = (current_fcf / older_fcf) ** (1 / 2) - 1
-            else:
-                fcf_growth = 0.08  # Default 8%
+            fcf_growth = (
+                (current_fcf / older_fcf) ** (1 / 2) - 1 if older_fcf > 0 else 0.05
+            )
         else:
-            fcf_growth = 0.08  # Default 8%
+            fcf_growth = 0.05  # Default 5%
+        fcf_growth = max(0.03, min(0.15, fcf_growth))  # Cap growth at 3-15%
 
-        # Cap growth rate at reasonable bounds
-        fcf_growth = max(0.03, min(0.25, fcf_growth))  # 3% to 25%
+        # --- Enhanced WACC Calculation ---
+        market_cap = info.get("marketCap", 0)
+        total_debt = info.get("totalDebt", 0)
+        total_capital = market_cap + total_debt
+        if total_capital == 0:
+            return {"DCF Fair Value": None, "DCF Notes": "Missing capital structure"}
 
-        # DCF Parameters
-        projection_years = 5
-        terminal_growth = 0.025  # 2.5% perpetuity growth
+        equity_weight = market_cap / total_capital
+        debt_weight = total_debt / total_capital
 
-        # Estimate WACC (simplified)
         beta = info.get("beta", 1.0) or 1.0
-        # risk_free_rate passed as argument
-        market_premium = 0.055  # Historical equity risk premium
+        market_premium = 0.055
         cost_of_equity = risk_free_rate + beta * market_premium
 
-        # Simplified WACC (assume 30% debt at 6% cost)
-        debt_weight = 0.30
-        equity_weight = 0.70
-        cost_of_debt = 0.06
-        tax_rate = 0.21
+        # Estimate cost of debt (e.g., interest expense / total debt)
+        income_stmt = ticker.financials
+        interest_expense = (
+            income_stmt.loc["Interest Expense"].iloc[0]
+            if "Interest Expense" in income_stmt.index
+            else 0
+        )
+        cost_of_debt = abs(interest_expense) / total_debt if total_debt > 0 else 0.05
+        cost_of_debt = max(0.04, min(cost_of_debt, 0.09))  # Bound cost of debt
+
+        tax_rate = 0.21  # Default tax rate
+        if (
+            "Tax Provision" in income_stmt.index
+            and "Pretax Income" in income_stmt.index
+        ):
+            tax_provision = income_stmt.loc["Tax Provision"].iloc[0]
+            pretax_income = income_stmt.loc["Pretax Income"].iloc[0]
+            if pretax_income > 0:
+                tax_rate = tax_provision / pretax_income
+
         wacc = equity_weight * cost_of_equity + debt_weight * cost_of_debt * (
             1 - tax_rate
         )
-        wacc = max(0.08, min(0.15, wacc))  # Cap WACC at 8-15%
+        wacc = max(0.07, min(0.12, wacc))  # Cap WACC at 7-12% for stability
 
-        # Project FCF for 5 years
+        # --- DCF Projection ---
+        projection_years = 5
+        terminal_growth = 0.025
         projected_fcf = []
         fcf = current_fcf
-        for year in range(1, projection_years + 1):
-            fcf = fcf * (1 + fcf_growth)
-            # Apply growth decay (growth slows over time)
-            fcf_growth = fcf_growth * 0.9  # 10% decay per year
+        growth_decay = 0.9
+        for _ in range(1, projection_years + 1):
+            fcf *= 1 + fcf_growth
+            fcf_growth *= growth_decay
             projected_fcf.append(fcf)
 
-        # Calculate present value of projected FCFs
-        pv_fcf = 0
-        for i, fcf in enumerate(projected_fcf):
-            pv_fcf += fcf / ((1 + wacc) ** (i + 1))
+        pv_fcf = sum(
+            fcf / ((1 + wacc) ** (i + 1)) for i, fcf in enumerate(projected_fcf)
+        )
 
-        # Calculate terminal value (Gordon Growth Model)
         terminal_fcf = projected_fcf[-1] * (1 + terminal_growth)
         terminal_value = terminal_fcf / (wacc - terminal_growth)
         pv_terminal = terminal_value / ((1 + wacc) ** projection_years)
 
-        # Enterprise Value
         enterprise_value = pv_fcf + pv_terminal
-
-        # Adjust for net debt to get equity value
-        total_cash = info.get("totalCash", 0) or 0
-        total_debt = info.get("totalDebt", 0) or 0
-        net_debt = total_debt - total_cash
+        net_debt = total_debt - info.get("totalCash", 0)
         equity_value = enterprise_value - net_debt
 
-        # Get shares outstanding
-        shares_outstanding = info.get("sharesOutstanding", 0)
-        if not shares_outstanding or shares_outstanding <= 0:
-            return {
-                "DCF Fair Value": None,
-                "DCF Upside (%)": None,
-                "DCF Notes": "No shares data",
-            }
+        shares_outstanding = info.get("sharesOutstanding")
+        if not shares_outstanding:
+            return {"DCF Fair Value": None, "DCF Notes": "No shares data"}
 
-        # Calculate fair value per share
         dcf_fair_value = equity_value / shares_outstanding
-
         if dcf_fair_value <= 0:
-            return {
-                "DCF Fair Value": None,
-                "DCF Upside (%)": None,
-                "DCF Notes": "Negative equity value",
-            }
+            return {"DCF Fair Value": None, "DCF Notes": "Negative equity value"}
 
-        # Calculate upside vs current price
-        current_price = info.get("currentPrice", 0) or info.get("regularMarketPrice", 0)
-        dcf_upside = None
-        if current_price and current_price > 0:
-            dcf_upside = ((dcf_fair_value - current_price) / current_price) * 100
+        current_price = info.get("currentPrice")
+        dcf_upside = (
+            ((dcf_fair_value - current_price) / current_price) * 100
+            if current_price
+            else None
+        )
 
         return {
             "DCF Fair Value": round(dcf_fair_value, 2),
-            "DCF Upside (%)": round(dcf_upside, 1) if dcf_upside else None,
-            "DCF Notes": f"WACC={wacc * 100:.1f}%, Growth={fcf_growth * 100:.1f}%",
+            "DCF Upside (%)": round(dcf_upside, 1) if dcf_upside is not None else None,
+            "DCF Notes": f"WACC={wacc * 100:.1f}%, FCF Growth={fcf_growth * 100:.1f}%",
         }
 
     except Exception as e:
@@ -987,7 +1495,7 @@ def calculate_graham_number(eps: float, book_value_per_share: float) -> Optional
 def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     """
     Stage 2: Deep financial analysis on Stage 1 candidates.
-    Calculates P/FCF, ROIC, and 3-year CAGR.
+    Calculates P/FCF, ROIC, and 3-year CAGR, and applies sector-relative screening.
     """
     print("\n" + "=" * 60)
     print("STAGE 2: Running Custom Ticker Analysis")
@@ -998,178 +1506,145 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
 
     results = []
     tickers = stage1_df["symbol"].tolist() if "symbol" in stage1_df.columns else []
-
-    # Fetch dynamic risk-free rate for DCF
     risk_free_rate = fetch_treasury_yield()
     print(f"  Using Risk-Free Rate (10Y Treasury): {risk_free_rate * 100:.2f}%")
 
+    # Define relative tolerance from config, with a fallback
+    SECTOR_TOLERANCE = CONFIG.get("sector_relative_tolerance", 1.2)  # e.g., 20% premium
+
     for i, symbol in enumerate(tickers):
         print(f"  Analyzing {symbol} ({i + 1}/{len(tickers)})...", end=" ")
-
-        result_row = {
-            "Symbol": symbol,
-            "Stage 2 Pass": False,
-            "Failure Reason": "Unknown",
-        }  # Initialize for error cases
-
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
 
-            # Apply excluded_sectors filter here
             current_sector = info.get("sector")
-            excluded_sectors = CONFIG.get("excluded_sectors", [])
-            if current_sector and current_sector in excluded_sectors:
-                print(f"SKIP (Excluded Sector: {current_sector})")
+            if not current_sector or current_sector in CONFIG.get(
+                "excluded_sectors", []
+            ):
+                print(f"SKIP (Sector: {current_sector or 'N/A'})")
                 continue
 
             market_cap = info.get("marketCap", 0)
             if not market_cap:
                 print("SKIP (no market cap)")
-                result_row["Failure Reason"] = "No market cap"
-                results.append(result_row)
                 continue
 
-            # Calculate P/FCF
+            # --- Key Metric Calculations ---
             pfcf = calculate_pfcf(ticker, market_cap)
-
-            # Calculate ROIC
             roic = calculate_roic(ticker)
-
-            # Calculate 3-Year Revenue CAGR
             income = ticker.financials
-            rev_cagr = None
-            eps_cagr = None
-
-            if not income.empty:
-                if "Total Revenue" in income.index:
-                    revenues = income.loc["Total Revenue"].dropna().tolist()
-                    rev_cagr = calculate_cagr(revenues, 3)
-
-                if "Basic EPS" in income.index:
-                    eps_values = income.loc["Basic EPS"].dropna().tolist()
-                    eps_cagr = calculate_cagr(eps_values, 3)
-
-            # Get analyst data
-            current_price = info.get("currentPrice", 0) or info.get(
-                "regularMarketPrice", 0
+            rev_cagr = (
+                calculate_cagr(income.loc["Total Revenue"].dropna().tolist(), 3)
+                if not income.empty and "Total Revenue" in income.index
+                else None
             )
-            target_price = info.get("targetMeanPrice", None)
-            upside_pct = None
-            if current_price and target_price:
-                upside_pct = ((target_price - current_price) / current_price) * 100
 
-            # Analyst recommendations (from info dict)
-            analyst_rating = info.get("recommendationKey", "N/A")
-            num_analysts = info.get("numberOfAnalystOpinions", 0)
+            # --- Sector-Relative Analysis ---
+            sector_medians = get_sector_median_metrics(current_sector)
 
-            # Calculate Graham Number (intrinsic value)
-            eps = info.get("trailingEps", None)
-            book_value_per_share = info.get("bookValue", None)
-            graham_number = calculate_graham_number(eps, book_value_per_share)
+            # --- New Advanced Metrics (Phase 3) ---
+            growth_est = fetch_growth_estimates(ticker)
+            eps_rev = fetch_eps_revisions(ticker)
+            analyst_trend = fetch_analyst_recommendations(ticker)
 
-            # Graham margin of safety: is current price below Graham Number?
-            graham_upside = None
-            is_graham_undervalued = False
-            if graham_number and current_price and current_price > 0:
-                graham_upside = ((graham_number - current_price) / current_price) * 100
-                is_graham_undervalued = current_price < graham_number
+            # --- Technicals & Calendar (Phase 4), & Phase 5 (Valuation/Timing) ---
+            technicals = fetch_technical_signals(ticker)
+            calendar = check_earnings_calendar(ticker)
+            rsi = fetch_rsi(ticker)
+            peg = calculate_peg_ratio(ticker, info)
 
-            # Fetch Alpha Vantage data (if API key available)
-            if ALPHA_VANTAGE_API_KEY:
-                # Rate limit: Free tier is 5 calls/minute (1 call every 12s)
-                # We add a small delay to be safe
-                time.sleep(2)
-
-            av_data = fetch_alpha_vantage_overview(symbol)
-            av_metrics = get_alpha_vantage_metrics(av_data)
-
-            # Fetch additional Alpha Vantage data
-            earnings_data = fetch_earnings_data(symbol)
-            sentiment_data = fetch_sentiment_data(symbol)
-
-            # Check Stage 2 thresholds
+            # --- Stage 2 Filtering ---
             passed = True
             fail_reasons = []
 
-            if pfcf is not None and pfcf > PFCF_MAX:
-                passed = False
-                fail_reasons.append(f"P/FCF={pfcf:.1f}")
-
+            # Absolute checks (hard rules)
             if roic is not None and roic < ROIC_MIN:
                 passed = False
-                fail_reasons.append(f"ROIC={roic * 100:.1f}%")
-
+                fail_reasons.append(f"ROIC < {ROIC_MIN * 100:.0f}%")
             if rev_cagr is not None and rev_cagr < CAGR_MIN:
                 passed = False
-                fail_reasons.append(f"RevCAGR={rev_cagr * 100:.1f}%")
+                fail_reasons.append(f"3Y Rev CAGR < {CAGR_MIN * 100:.0f}%")
+            if info.get("recommendationKey") not in ACCEPTABLE_RATINGS:
+                passed = False
+                fail_reasons.append(f"Rating:{info.get('recommendationKey')}")
 
-            # D/E Filter (Stage 2 validation)
-            de_ratio = info.get("debtToEquity", None)
+            # Sector-relative checks
+            pe = info.get("trailingPE")
+            median_pe = sector_medians.get("Sector Median P/E")
+            if pe and median_pe and pe > median_pe * SECTOR_TOLERANCE:
+                passed = False
+                fail_reasons.append(f"P/E > Sector Median")
+
+            roe = info.get("returnOnEquity")
+            median_roe = sector_medians.get("Sector Median ROE")
             if (
-                de_ratio is not None and de_ratio > DE_MAX * 100
-            ):  # yfinance returns D/E as percentage (e.g. 150 for 1.5)
+                roe and median_roe and roe < median_roe * 0.8
+            ):  # Must be at least 80% of sector median
                 passed = False
-                fail_reasons.append(f"D/E={de_ratio:.1f}")
+                fail_reasons.append(f"ROE < Sector Median")
 
-            if analyst_rating not in ACCEPTABLE_RATINGS:
-                passed = False
-                fail_reasons.append(f"Analyst Rating={analyst_rating}")
-
+            # --- Compile Data ---
             status = "PASS" if passed else f"FAIL ({', '.join(fail_reasons)})"
             print(status)
 
-            # Calculate DCF Fair Value
+            current_price = info.get("currentPrice")
+            graham_number = calculate_graham_number(
+                info.get("trailingEps"), info.get("bookValue")
+            )
+            graham_upside = (
+                ((graham_number - current_price) / current_price) * 100
+                if graham_number and current_price
+                else None
+            )
+
             dcf_data = calculate_dcf_fair_value(ticker, info, risk_free_rate)
 
-            # Build result dict with all metrics
             result_row = {
                 "Symbol": symbol,
                 "Name": info.get("shortName", "N/A"),
-                "Sector": info.get("sector", "N/A"),
-                "Index": get_index_membership(symbol),  # SPY, QQQ, SPY/QQQ, or —
+                "Sector": current_sector,
                 "Market Cap ($B)": market_cap / 1e9,
-                "P/E": info.get("trailingPE", None),
-                "PEG": av_metrics.get("AV PEG", None),
-                "D/E": info.get("debtToEquity", None),
-                "ROE (%)": (info.get("returnOnEquity", 0) or 0) * 100,
-                "Gross Margin (%)": (info.get("grossMargins", 0) or 0) * 100,
-                "Op Margin (%)": (info.get("operatingMargins", 0) or 0) * 100,
+                "P/E": pe,
+                "ROE (%)": (roe or 0) * 100,
                 "P/FCF": pfcf,
-                "ROIC (%)": roic * 100 if roic else None,
-                "3Y Rev CAGR (%)": rev_cagr * 100 if rev_cagr else None,
-                "3Y EPS CAGR (%)": eps_cagr * 100 if eps_cagr else None,
-                # Analyst data
-                "Analyst Rating": analyst_rating,
-                "# Analysts": num_analysts,
-                "Target Price": target_price,
-                "Current Price": current_price,
-                "Upside (%)": upside_pct,
-                # Graham Number (intrinsic value)
-                "Graham Number": graham_number,
+                "ROIC (%)": (roic or 0) * 100,
+                "3Y Rev CAGR (%)": (rev_cagr or 0) * 100,
+                "Analyst Rating": info.get("recommendationKey"),
+                "# Analysts": info.get("numberOfAnalystOpinions"),
+                "Upside (%)": (
+                    (info.get("targetMeanPrice", 0) - current_price) / current_price
+                )
+                * 100
+                if info.get("targetMeanPrice") and current_price
+                else None,
+                "Graham Undervalued": current_price < graham_number
+                if current_price and graham_number
+                else False,
                 "Graham Upside (%)": graham_upside,
-                "Graham Undervalued": is_graham_undervalued,
-                # DCF Valuation
-                "DCF Fair Value": dcf_data.get("DCF Fair Value"),
-                "DCF Upside (%)": dcf_data.get("DCF Upside (%)"),
-                "DCF Notes": dcf_data.get("DCF Notes"),
                 "Stage 2 Pass": passed,
+                "Sector Median P/E": sector_medians.get("Sector Median P/E"),
+                "Sector Median ROE": sector_medians.get("Sector Median ROE"),
+                **dcf_data,
+                **sector_medians,
+                **growth_est,
+                **eps_rev,
+                **analyst_trend,
+                **technicals,
+                **calendar,
+                **rsi,
+                **peg,
             }
 
-            # Add Alpha Vantage metrics if available
-            result_row.update(av_metrics)
-            result_row.update(earnings_data)
-            result_row.update(sentiment_data)
-
-            # Calculate Conviction Score immediately
-            conviction, conviction_reasons = calculate_conviction_score(result_row)
-            result_row["Conviction Score"] = conviction
-            result_row["Conviction Reasons"] = "; ".join(conviction_reasons)
+            # Calculate Conviction Score (Fix for KeyError)
+            score, reasons = calculate_conviction_score(result_row)
+            result_row["Conviction Score"] = score
+            result_row["Conviction Reasons"] = "; ".join(reasons)
 
             results.append(result_row)
 
         except Exception as e:
-            print(f"ERROR ({e})")
+            print(f"ERROR processing {symbol}: {e}")
             continue
 
     return pd.DataFrame(results)
@@ -1431,8 +1906,9 @@ def main():
             "Sector",
             "Market Cap ($B)",
             "P/E",
-            "PEG",
+            "Sector Median P/E",
             "ROE (%)",
+            "Sector Median ROE",
             "P/FCF",
             "ROIC (%)",
             "3Y Rev CAGR (%)",
@@ -1442,8 +1918,8 @@ def main():
 
     # Export to CSV
     output_file = "screener_results.csv"
-    passed_df.to_csv(output_file, index=False)
-    print(f"\nFull results exported to: {output_file}")
+    results_df.to_csv(output_file, index=False)
+    print(f"\nFull results for all analyzed stocks exported to: {output_file}")
 
     # Build optimized portfolio from passing stocks
     portfolio_df = pd.DataFrame()
@@ -1454,12 +1930,17 @@ def main():
         advice_df = generate_investment_advice(passed_df)
 
         # Generate Professional PDF Report
-        from report_generator import generate_pdf_report
+        try:
+            from report_generator import generate_pdf_report
 
-        # Get risk free rate again or pass it down (it was calculated in run_stage2 but local scope)
-        # We'll fetch it again or use default
-        rf_rate = fetch_treasury_yield()
-        generate_pdf_report(advice_df, portfolio_df, rf_rate)
+            rf_rate = fetch_treasury_yield()
+            generate_pdf_report(advice_df, portfolio_df, rf_rate)
+        except ImportError:
+            print("\nSkipping PDF report: reportlab library not found.")
+            print("Install it with: pip install reportlab")
+        except Exception as e:
+            print(f"\nCould not generate PDF report: {e}")
+
     end_time = time.time()
     elapsed_time = timedelta(seconds=end_time - start_time)
     print(f"\nTotal runtime: {elapsed_time}")
