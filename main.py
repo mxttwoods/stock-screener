@@ -3,9 +3,10 @@ GARP Stock Screener - Two-Stage Implementation
 Based on RULES.md and IDEAS.md methodology
 """
 
+import argparse
+import json
 import os
 import time
-import json
 import warnings
 from datetime import datetime, timedelta
 from typing import Optional
@@ -24,9 +25,8 @@ warnings.filterwarnings("ignore")
 # Load environment variables from .env file
 load_dotenv()
 
-# OpenAI API configuration
+# OpenAI API configuration (optional)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-assert OPENAI_API_KEY, "OPENAI_API_KEY not found in environment variables"
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
@@ -76,6 +76,20 @@ FIFTYTWOWK_PERCENTCHANGE_MAX = CONFIG["growth"]["fiftytwowk_percentchange_max_pc
 
 DE_MAX = CONFIG["balance_sheet"]["debt_to_equity_max"]
 ACCEPTABLE_RATINGS = CONFIG["analyst"]["acceptable_ratings"]
+DEFAULT_STAGE1_SIZE = CONFIG.get("stage1_size", 250)
+
+# =============================================================================
+# SHARED HELPERS
+# =============================================================================
+_TICKER_CACHE: dict[str, yf.Ticker] = {}
+
+
+def get_ticker(symbol: str) -> yf.Ticker:
+    """Return a cached yfinance.Ticker instance for the given symbol."""
+    sym = symbol.upper()
+    if sym not in _TICKER_CACHE:
+        _TICKER_CACHE[sym] = yf.Ticker(sym)
+    return _TICKER_CACHE[sym]
 
 
 # =============================================================================
@@ -479,6 +493,51 @@ def calculate_quality_of_earnings(ticker) -> dict:
         return {"Quality of Earnings Ratio": None, "Earnings Quality Concern": False}
 
 
+def fetch_sector_trend(sector: str) -> dict:
+    """
+    Check if the sector ETF is in an uptrend (Price > SMA200).
+    Returns trend status and SMA200 gap.
+    """
+    # Map sectors to ETFs
+    SECTOR_ETFS = {
+        "Technology": "XLK",
+        "Healthcare": "XLV",
+        "Financial Services": "XLF",
+        "Consumer Cyclical": "XLY",
+        "Communication Services": "XLC",
+        "Industrials": "XLI",
+        "Consumer Defensive": "XLP",
+        "Energy": "XLE",
+        "Utilities": "XLU",
+        "Real Estate": "XLRE",
+        "Basic Materials": "XLB",
+    }
+
+    ticker_symbol = SECTOR_ETFS.get(sector)
+    if not ticker_symbol:
+        return {"Sector Trend": "Unknown", "Sector Ticker": "N/A"}
+
+    try:
+        etf = yf.Ticker(ticker_symbol)
+        hist = etf.history(period="1y")
+        if hist.empty or len(hist) < 200:
+            return {"Sector Trend": "Unknown", "Sector Ticker": ticker_symbol}
+
+        sma200 = hist["Close"].rolling(window=200).mean().iloc[-1]
+        current_price = hist["Close"].iloc[-1]
+
+        trend = "Uptrend" if current_price > sma200 else "Downtrend"
+        gap = ((current_price - sma200) / sma200) * 100
+
+        return {
+            "Sector Trend": trend,
+            "Sector Ticker": ticker_symbol,
+            "Sector SMA200 Gap (%)": round(gap, 2),
+        }
+    except Exception:
+        return {"Sector Trend": "Error", "Sector Ticker": ticker_symbol}
+
+
 def calculate_peg_ratio(ticker, info: dict) -> dict:
     """
     Calculate PEG Ratio (Price/Earnings-to-Growth).
@@ -866,6 +925,22 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
         score -= 1
         reasons.append(f"High P/E ({pe:.1f}) ⚠️")
 
+    # Penalty for expensive valuation or leverage
+    pfcf_penalty = stock_data.get("P/FCF")
+    if pfcf_penalty is not None and pfcf_penalty > PFCF_MAX:
+        score -= 1
+        reasons.append(f"Rich P/FCF ({pfcf_penalty:.1f}) ⚠️")
+
+    if peg and peg > 2.5:
+        score -= 1
+        reasons.append(f"High PEG ({peg}) ⚠️")
+
+    leverage = stock_data.get("D/E", 0) or 0
+    leverage_limit = DE_MAX * 100  # Aligns with Stage 1/2 scaling
+    if leverage and leverage > leverage_limit:
+        score -= 1
+        reasons.append(f"High leverage (D/E: {leverage:.1f}) ⚠️")
+
     # Cap score at 1-10
     score = max(1, min(10, score))
 
@@ -883,9 +958,9 @@ def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
     if beta > 1.5:
         warnings.append(f"⚠️ High volatility (Beta: {beta:.2f})")
 
-    # High D/E (> 100)
+    # High D/E aligned with config max
     de = stock_data.get("D/E", 0) or 0
-    if de > 100:
+    if de > DE_MAX * 100:
         warnings.append(f"⚠️ High leverage (D/E: {de:.1f})")
 
     # Negative Graham Upside (significantly overvalued)
@@ -921,6 +996,11 @@ def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
     if rsi > 70:
         warnings.append(f"⚠️ Overbought (RSI: {rsi:.0f})")
 
+    # Sector Trend Warning
+    if stock_data.get("Sector Trend") == "Downtrend":
+        gap = stock_data.get("Sector SMA200 Gap (%)")
+        warnings.append(f"⚠️ Sector Downtrend (Gap: {gap}%)")
+
     # Bearish Sentiment
     sentiment_label = str(stock_data.get("News Sentiment Label", "")).lower()
     if "bearish" in sentiment_label and sentiment_label != "nan":
@@ -950,7 +1030,7 @@ def generate_ai_thesis(
     Generate an AI-powered investment thesis using OpenAI.
     """
     if not openai_client:
-        return "AI thesis unavailable (no API key)"
+        return "AI thesis unavailable (disabled or no API key)"
 
     try:
         # Build context for the AI
@@ -975,7 +1055,7 @@ Company Profile:
 
 Financials & Profitability:
 - P/E: {stock_data.get("P/E", "N/A")} {pe_comparison}
-- PEG: {stock_data.get("PEG", "N/A")}
+- PEG: {stock_data.get("PEG Ratio", "N/A")}
 - ROE: {stock_data.get("ROE (%)", "N/A")}% {roe_comparison}
 - ROIC: {stock_data.get("ROIC (%)", "N/A")}%
 - Margins: Gross {stock_data.get("Gross Margin (%)", "N/A")}%, Op {stock_data.get("Op Margin (%)", "N/A")}%
@@ -983,8 +1063,8 @@ Financials & Profitability:
 Growth:
 - 3Y Revenue CAGR: {stock_data.get("3Y Rev CAGR (%)", "N/A")}%
 - Next Yr Growth Est: {stock_data.get("Next Year Growth Est (%)", "N/A")}%
-- Quarterly Revenue Growth (YoY): {stock_data.get("AV Quarterly Revenue Growth", "N/A")}%
-- Quarterly Earnings Growth (YoY): {stock_data.get("AV Quarterly Earnings Growth", "N/A")}%
+- Quarterly Revenue Growth (YoY): {stock_data.get("Quarterly Revenue Growth (%)", "N/A")}%
+- Quarterly Earnings Growth (YoY): {stock_data.get("Quarterly Earnings Growth (%)", "N/A")}%
 
 Valuation Models:
 - Graham Number: ${stock_data.get("Graham Number", "N/A")} (Undervalued: {stock_data.get("Graham Undervalued", "N/A")})
@@ -993,7 +1073,7 @@ Valuation Models:
 - Analyst Target: ${stock_data.get("Target Price", "N/A")} (Upside: {stock_data.get("Upside (%)", "N/A")}%)
 
 Sentiment & Momentum:
-- Price vs 52W Range: Current ${stock_data.get("Current Price", "N/A")} (Range: ${stock_data.get("AV 52W Low", "N/A")} - ${stock_data.get("AV 52W High", "N/A")})
+- Price vs 52W Range: Current ${stock_data.get("Current Price", "N/A")} (Range: ${stock_data.get("52W Low", "N/A")} - ${stock_data.get("52W High", "N/A")})
 - News Sentiment: {stock_data.get("News Sentiment Label", "N/A")} (Score: {stock_data.get("News Sentiment Score", "N/A")})
 - EPS Revisions (30d): {stock_data.get("EPS Up/Down Ratio", "N/A")}x (Up: {stock_data.get("EPS Revisions Up (30d)", 0)} / Down: {stock_data.get("EPS Revisions Down (30d)", 0)})
 - Analyst Trend (3mo): {stock_data.get("Analyst Trend", "N/A")} ({stock_data.get("Current Buy Ratings", 0)} Buys)
@@ -1007,6 +1087,7 @@ Risk Profile:
 - Identified Risks: {", ".join(risks) if risks else "None"}
 - Debt/Equity: {stock_data.get("D/E", "N/A")}
 - Upcoming Earnings: {"Yes, in " + str(stock_data.get("Days to Earnings")) + " days" if stock_data.get("Upcoming Earnings") else "No"}
+- Sector Trend: {stock_data.get("Sector Trend", "N/A")} (SMA200 Gap: {stock_data.get("Sector SMA200 Gap (%)", "N/A")}%)
 
 Task:
 1. Synthesize the signals (e.g., "Trading at a discount to its sector P/E median").
@@ -1035,6 +1116,97 @@ Task:
         return f"AI thesis error: {str(e)[:50]}"
 
 
+def backtest_portfolio(tickers, weights) -> None:
+    """
+    Backtest the selected portfolio vs SPY for the last 1 year.
+    Prints metrics and saves to CSV.
+    """
+    print("\n" + "=" * 60)
+    print("BACKTESTING: Portfolio vs SPY (1 Year)")
+    print("=" * 60)
+
+    try:
+        if not tickers:
+            print("  No tickers to backtest.")
+            return
+
+        # Download data
+        all_symbols = tickers + ["SPY"]
+        data = yf.download(all_symbols, period="1y", interval="1d", progress=False)[
+            "Close"
+        ]
+
+        if data.empty:
+            print("  Error: No historical data found.")
+            return
+
+        # Calculate Returns
+        returns = data.pct_change().dropna()
+
+        # Portfolio Returns
+        # weights dict must be ordered same as data columns, but data cols are sorted alphabetically usually
+        # Realign weights
+        sorted_tickers = [t for t in all_symbols if t != "SPY" and t in data.columns]
+
+        # Create weight array aligned with sorted_tickers
+        # Assuming weights is a list corresponding to input 'tickers' list
+        # We need a robust mapping.
+        weight_map = dict(zip(tickers, weights))
+
+        # Calculate weighted daily returns
+        # We'll do it manually: sum(return * weight)
+        port_daily_ret = pd.Series(0, index=returns.index)
+        for t in sorted_tickers:
+            w = weight_map.get(t, 0)
+            port_daily_ret += returns[t] * w
+
+        spy_daily_ret = returns["SPY"]
+
+        # Cumulative Returns
+        port_cum_ret = (1 + port_daily_ret).cumprod()
+        spy_cum_ret = (1 + spy_daily_ret).cumprod()
+
+        total_ret_port = (port_cum_ret.iloc[-1] - 1) * 100
+        total_ret_spy = (spy_cum_ret.iloc[-1] - 1) * 100
+
+        # Max Drawdown
+        # Roll max
+        roll_max_port = port_cum_ret.cummax()
+        drawdown_port = (port_cum_ret / roll_max_port) - 1
+        max_dd_port = drawdown_port.min() * 100
+
+        roll_max_spy = spy_cum_ret.cummax()
+        drawdown_spy = (spy_cum_ret / roll_max_spy) - 1
+        max_dd_spy = drawdown_spy.min() * 100
+
+        # Sharpe (Annualized) - assuming 252 days
+        sharpe_port = (port_daily_ret.mean() / port_daily_ret.std()) * np.sqrt(252)
+        sharpe_spy = (spy_daily_ret.mean() / spy_daily_ret.std()) * np.sqrt(252)
+
+        print(f"  Portfolio Return (1Y): {total_ret_port:.2f}%")
+        print(f"  SPY Return (1Y):       {total_ret_spy:.2f}%")
+        print(f"  Alpha:                 {total_ret_port - total_ret_spy:.2f}%")
+        print("-" * 40)
+        print(f"  Portfolio Max DD:      {max_dd_port:.2f}%")
+        print(f"  SPY Max DD:            {max_dd_spy:.2f}%")
+        print(f"  Portfolio Sharpe:      {sharpe_port:.2f}")
+        print(f"  SPY Sharpe:            {sharpe_spy:.2f}")
+
+        # Save results
+        results_df = pd.DataFrame(
+            {
+                "Date": port_cum_ret.index,
+                "Portfolio Value": port_cum_ret,
+                "SPY Value": spy_cum_ret,
+            }
+        )
+        results_df.to_csv("backtest_results.csv")
+        print("\n  Backtest data saved to: backtest_results.csv")
+
+    except Exception as e:
+        print(f"  Error during backtest: {e}")
+
+
 def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
     """
     Generate comprehensive investment advice for all passing stocks.
@@ -1057,7 +1229,7 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
 
         # Get additional ticker info for risk warnings
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = get_ticker(symbol)
             ticker_info = ticker.info
         except Exception as e:
             print(f"ERROR getting ticker info for {symbol}: {e}")
@@ -1275,7 +1447,7 @@ def build_stage1_query() -> EquityQuery:
         EquityQuery("gte", ["basicepscontinuingoperations.lasttwelvemonths", 0.001]),
         EquityQuery("gte", ["epsgrowth.lasttwelvemonths", GROWTH_MIN]),
         # P/E < 50
-        EquityQuery("btwn", ["peratio.lasttwelvemonths", 10, PE_MAX]),
+        EquityQuery("btwn", ["peratio.lasttwelvemonths", 0, PE_MAX]),
         # PEG < 3
         EquityQuery("lte", ["pegratio_5y", PEG_MAX]),
         # D/E < 100 (1.0)
@@ -1288,11 +1460,11 @@ def build_stage1_query() -> EquityQuery:
         EquityQuery("gte", ["totalrevenues1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
         EquityQuery("gte", ["quarterlyrevenuegrowth.quarterly", GROWTH_MIN_PCT]),
         # EBITDA Growth >= 6%
-        EquityQuery("gte", ["ebitda1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # EquityQuery("gte", ["ebitda1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
         # Net Income Growth >= 6%
-        EquityQuery("gte", ["netincome1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # EquityQuery("gte", ["netincome1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
         # Diluted EPS Growth >= 6%
-        EquityQuery("gte", ["dilutedeps1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # EquityQuery("gte", ["dilutedeps1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
         # Current Ratio >= 1.0 (Liquidity)
         EquityQuery(
             "btwn", ["currentratio.lasttwelvemonths", 1, CURRENT_RATIO_MAX_PCT]
@@ -1322,7 +1494,7 @@ def build_stage1_query() -> EquityQuery:
     return EquityQuery("and", filters)
 
 
-def run_stage1() -> pd.DataFrame:
+def run_stage1(limit: int = DEFAULT_STAGE1_SIZE) -> pd.DataFrame:
     """
     Execute Stage 1 screening via yfinance API.
     Returns DataFrame of stocks passing initial filters.
@@ -1334,7 +1506,9 @@ def run_stage1() -> pd.DataFrame:
     query = build_stage1_query()
 
     try:
-        result = yf.screen(query, size=50, sortField="intradaymarketcap", sortAsc=False)
+        result = yf.screen(
+            query, size=limit, sortField="intradaymarketcap", sortAsc=False
+        )
 
         if result is None or "quotes" not in result:
             print("No results from Stage 1 screening")
@@ -1365,22 +1539,47 @@ def run_stage1() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def calculate_pfcf(ticker: yf.Ticker, market_cap: float) -> Optional[float]:
-    """Calculate Price-to-Free Cash Flow ratio."""
-    try:
-        cf = ticker.cashflow
-        if cf.empty:
-            return None
+def build_manual_stage1_df(symbols: list[str]) -> pd.DataFrame:
+    """Build a Stage 1-like DataFrame from user supplied tickers."""
+    cleaned = [s.upper() for s in symbols if s]
+    if not cleaned:
+        return pd.DataFrame()
+    return pd.DataFrame({"symbol": cleaned})
 
-        # Try to get Free Cash Flow or calculate from Operating CF - CapEx
-        if "Free Cash Flow" in cf.index:
-            fcf = cf.loc["Free Cash Flow"].iloc[0]
-        elif "Operating Cash Flow" in cf.index and "Capital Expenditure" in cf.index:
-            ocf = cf.loc["Operating Cash Flow"].iloc[0]
-            capex = cf.loc["Capital Expenditure"].iloc[0]
-            fcf = ocf + capex  # CapEx is negative
-        else:
-            return None
+
+def calculate_pfcf(
+    ticker: yf.Ticker, market_cap: float, info: Optional[dict] = None
+) -> Optional[float]:
+    """Calculate Price-to-Free Cash Flow ratio with robust fallbacks."""
+    try:
+        info = info or ticker.info
+        cashflow = getattr(ticker, "cashflow", pd.DataFrame())
+        if cashflow is None or cashflow.empty:
+            cashflow = getattr(ticker, "cash_flow", pd.DataFrame()) or pd.DataFrame()
+
+        fcf = None
+        if cashflow is not None and not cashflow.empty:
+            if "Free Cash Flow" in cashflow.index:
+                fcf = cashflow.loc["Free Cash Flow"].iloc[0]
+            else:
+                ocf = None
+                capex = None
+                for key in [
+                    "Operating Cash Flow",
+                    "Total Cash From Operating Activities",
+                ]:
+                    if key in cashflow.index:
+                        ocf = cashflow.loc[key].iloc[0]
+                        break
+                for key in ["Capital Expenditure"]:
+                    if key in cashflow.index:
+                        capex = cashflow.loc[key].iloc[0]
+                        break
+                if ocf is not None and capex is not None:
+                    fcf = ocf + capex  # CapEx is negative
+
+        if fcf is None and info:
+            fcf = info.get("freeCashflow")
 
         if fcf is None or fcf <= 0:
             return None
@@ -1515,8 +1714,10 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     for i, symbol in enumerate(tickers):
         print(f"  Analyzing {symbol} ({i + 1}/{len(tickers)})...", end=" ")
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = get_ticker(symbol)
             info = ticker.info
+            rating = (info.get("recommendationKey") or "").lower()
+            num_analysts = info.get("numberOfAnalystOpinions") or 0
 
             current_sector = info.get("sector")
             if not current_sector or current_sector in CONFIG.get(
@@ -1531,7 +1732,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 continue
 
             # --- Key Metric Calculations ---
-            pfcf = calculate_pfcf(ticker, market_cap)
+            pfcf = calculate_pfcf(ticker, market_cap, info)
             roic = calculate_roic(ticker)
             income = ticker.financials
             rev_cagr = (
@@ -1539,12 +1740,14 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 if not income.empty and "Total Revenue" in income.index
                 else None
             )
+            rev_cagr_pct = rev_cagr * 100 if rev_cagr is not None else None
 
             # --- Sector-Relative Analysis ---
             sector_medians = get_sector_median_metrics(current_sector)
 
             # --- New Advanced Metrics (Phase 3) ---
             growth_est = fetch_growth_estimates(ticker)
+            growth_est_pct = growth_est.get("Next Year Growth Est (%)")
             eps_rev = fetch_eps_revisions(ticker)
             analyst_trend = fetch_analyst_recommendations(ticker)
 
@@ -1553,28 +1756,48 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             calendar = check_earnings_calendar(ticker)
             rsi = fetch_rsi(ticker)
             peg = calculate_peg_ratio(ticker, info)
+            peg_ratio = peg.get("PEG Ratio")
+            sector_trend = fetch_sector_trend(current_sector)
 
             # --- Stage 2 Filtering ---
             passed = True
             fail_reasons = []
 
             # Absolute checks (hard rules)
+            if pfcf is None or pfcf <= 0:
+                passed = False
+                fail_reasons.append("No/negative FCF")
+            elif pfcf > PFCF_MAX:
+                passed = False
+                fail_reasons.append(f"P/FCF > {PFCF_MAX}")
             if roic is not None and roic < ROIC_MIN:
                 passed = False
                 fail_reasons.append(f"ROIC < {ROIC_MIN * 100:.0f}%")
             if rev_cagr is not None and rev_cagr < CAGR_MIN:
                 passed = False
                 fail_reasons.append(f"3Y Rev CAGR < {CAGR_MIN * 100:.0f}%")
-            if info.get("recommendationKey") not in ACCEPTABLE_RATINGS:
+            if rating and rating not in ACCEPTABLE_RATINGS:
                 passed = False
-                fail_reasons.append(f"Rating:{info.get('recommendationKey')}")
+                fail_reasons.append(f"Rating:{rating}")
 
             # Sector-relative checks
             pe = info.get("trailingPE")
             median_pe = sector_medians.get("Sector Median P/E")
-            if pe and median_pe and pe > median_pe * SECTOR_TOLERANCE:
-                passed = False
-                fail_reasons.append(f"P/E > Sector Median")
+            if pe and median_pe:
+                pe_rich = pe > median_pe * SECTOR_TOLERANCE
+                if pe_rich:
+                    growth_ok = False
+                    if peg_ratio is not None and peg_ratio <= 1.5:
+                        growth_ok = True
+                    if rev_cagr_pct is not None and rev_cagr_pct >= (
+                        CAGR_MIN * 100 * 1.5
+                    ):
+                        growth_ok = True
+                    if growth_est_pct is not None and growth_est_pct >= 15:
+                        growth_ok = True
+                    if not growth_ok:
+                        passed = False
+                        fail_reasons.append("P/E rich vs sector without growth")
 
             roe = info.get("returnOnEquity")
             median_roe = sector_medians.get("Sector Median ROE")
@@ -1589,6 +1812,15 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             print(status)
 
             current_price = info.get("currentPrice")
+            de_ratio = info.get("debtToEquity")
+            beta = info.get("beta")
+            dividend_yield = info.get("dividendYield")
+            revenue_growth = info.get("revenueGrowth") or info.get(
+                "revenueQuarterlyGrowth"
+            )
+            earnings_growth = info.get("earningsQuarterlyGrowth")
+            fifty_two_low = info.get("fiftyTwoWeekLow")
+            fifty_two_high = info.get("fiftyTwoWeekHigh")
             graham_number = calculate_graham_number(
                 info.get("trailingEps"), info.get("bookValue")
             )
@@ -1608,10 +1840,24 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 "P/E": pe,
                 "ROE (%)": (roe or 0) * 100,
                 "P/FCF": pfcf,
+                "D/E": de_ratio,
+                "Beta": beta,
                 "ROIC (%)": (roic or 0) * 100,
-                "3Y Rev CAGR (%)": (rev_cagr or 0) * 100,
-                "Analyst Rating": info.get("recommendationKey"),
-                "# Analysts": info.get("numberOfAnalystOpinions"),
+                "Dividend Yield (%)": (dividend_yield or 0) * 100
+                if dividend_yield
+                else None,
+                "Quarterly Revenue Growth (%)": (revenue_growth or 0) * 100
+                if revenue_growth
+                else None,
+                "Quarterly Earnings Growth (%)": (earnings_growth or 0) * 100
+                if earnings_growth
+                else None,
+                "52W Low": fifty_two_low,
+                "52W High": fifty_two_high,
+                "Current Price": current_price,
+                "3Y Rev CAGR (%)": rev_cagr_pct or 0,
+                "Analyst Rating": rating,
+                "# Analysts": num_analysts,
                 "Upside (%)": (
                     (info.get("targetMeanPrice", 0) - current_price) / current_price
                 )
@@ -1634,6 +1880,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 **calendar,
                 **rsi,
                 **peg,
+                **sector_trend,
             }
 
             # Calculate Conviction Score (Fix for KeyError)
@@ -1865,15 +2112,64 @@ def _build_equal_weight_portfolio(symbols: list) -> pd.DataFrame:
     return portfolio_df
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="GARP stock screener")
+    parser.add_argument(
+        "--tickers",
+        nargs="+",
+        help="Skip Stage 1 and run Stage 2 on specific tickers.",
+    )
+    parser.add_argument(
+        "--stage1-size",
+        type=int,
+        default=DEFAULT_STAGE1_SIZE,
+        help="Max number of tickers to request from the Stage 1 API filter.",
+    )
+    parser.add_argument(
+        "--skip-ai",
+        action="store_true",
+        help="Disable OpenAI-powered features (sentiment & thesis).",
+    )
+    parser.add_argument(
+        "--skip-advice",
+        action="store_true",
+        help="Skip AI-powered investment advice generation.",
+    )
+    parser.add_argument(
+        "--skip-portfolio",
+        action="store_true",
+        help="Skip portfolio optimization/backtest and only export screener results.",
+    )
+    parser.add_argument(
+        "--skip-pdf",
+        action="store_true",
+        help="Skip PDF research report generation.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     start_time = time.time()
     """Main entry point for the GARP stock screener."""
     print("\n" + "=" * 60)
     print("       GARP STOCK SCREENER - Two-Stage Implementation")
     print("=" * 60)
 
-    # Stage 1: Fast API filtering
-    stage1_df = run_stage1()
+    global openai_client
+    if args.skip_ai or not OPENAI_API_KEY:
+        if not OPENAI_API_KEY and not args.skip_ai:
+            print("OpenAI key not provided; AI features disabled.")
+        openai_client = None
+
+    # Stage 1: Fast API filtering (or manual tickers)
+    if args.tickers:
+        print(
+            f"Skipping Stage 1 API call. Running Stage 2 on user tickers: {', '.join(args.tickers)}"
+        )
+        stage1_df = build_manual_stage1_df(args.tickers)
+    else:
+        stage1_df = run_stage1(limit=args.stage1_size)
 
     if stage1_df.empty:
         print("\nNo stocks passed Stage 1 filters. Consider relaxing criteria.")
@@ -1923,23 +2219,26 @@ def main():
 
     # Build optimized portfolio from passing stocks
     portfolio_df = pd.DataFrame()
-    if not passed_df.empty:
+    advice_df = pd.DataFrame()
+    if not passed_df.empty and not args.skip_portfolio:
         portfolio_df = build_optimized_portfolio(passed_df)
 
+    if not passed_df.empty and not args.skip_advice:
         # Generate AI-powered investment advice
         advice_df = generate_investment_advice(passed_df)
 
         # Generate Professional PDF Report
-        try:
-            from report_generator import generate_pdf_report
+        if not args.skip_pdf:
+            try:
+                from report_generator import generate_pdf_report
 
-            rf_rate = fetch_treasury_yield()
-            generate_pdf_report(advice_df, portfolio_df, rf_rate)
-        except ImportError:
-            print("\nSkipping PDF report: reportlab library not found.")
-            print("Install it with: pip install reportlab")
-        except Exception as e:
-            print(f"\nCould not generate PDF report: {e}")
+                rf_rate = fetch_treasury_yield()
+                generate_pdf_report(advice_df, portfolio_df, rf_rate)
+            except ImportError:
+                print("\nSkipping PDF report: reportlab library not found.")
+                print("Install it with: pip install reportlab")
+            except Exception as e:
+                print(f"\nCould not generate PDF report: {e}")
 
     end_time = time.time()
     elapsed_time = timedelta(seconds=end_time - start_time)
