@@ -35,3 +35,4 @@ excluded_symbols:
 excluded_sectors:
 - Energy
 - Basic Materials
+- Utilities

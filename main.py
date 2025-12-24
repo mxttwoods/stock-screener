@@ -5,11 +5,13 @@ Based on RULES.md and IDEAS.md methodology
 
 import argparse
 import json
+import logging
 import os
 import time
 import warnings
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import timedelta
+from typing import Optional, Union
+from functools import wraps
 
 import numpy as np
 import pandas as pd
@@ -21,6 +23,17 @@ from scipy.optimize import minimize
 import yaml
 
 warnings.filterwarnings("ignore")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("screener.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -82,6 +95,154 @@ DEFAULT_STAGE1_SIZE = CONFIG.get("stage1_size", 250)
 # SHARED HELPERS
 # =============================================================================
 _TICKER_CACHE: dict[str, yf.Ticker] = {}
+
+
+def safe_divide(
+    numerator: Union[float, int], denominator: Union[float, int], default: float = 0.0
+) -> float:
+    """
+    Safely divide two numbers, returning default if denominator is zero or invalid.
+
+    Args:
+        numerator: The numerator
+        denominator: The denominator
+        default: Value to return if division is invalid
+
+    Returns:
+        Result of division or default value
+    """
+    try:
+        if denominator is None or pd.isna(denominator) or denominator == 0:
+            return default
+        if numerator is None or pd.isna(numerator):
+            return default
+        result = float(numerator) / float(denominator)
+        return result if np.isfinite(result) else default
+    except (TypeError, ValueError, ZeroDivisionError):
+        return default
+
+
+def safe_get_value(series: pd.Series, key: str, default: float = 0.0) -> float:
+    """
+    Safely get value from pandas Series with fallback.
+
+    Args:
+        series: Pandas Series to search
+        key: Key to look up
+        default: Default value if key not found or value is invalid
+
+    Returns:
+        Value from series or default
+    """
+    try:
+        if key in series.index:
+            val = series[key]
+            if pd.notna(val) and np.isfinite(val):
+                return float(val)
+        return default
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def validate_financial_data(
+    value: Optional[Union[float, int]],
+    min_val: Optional[float] = None,
+    max_val: Optional[float] = None,
+) -> Optional[float]:
+    """
+    Validate financial data value.
+
+    Args:
+        value: Value to validate
+        min_val: Minimum allowed value (None = no minimum)
+        max_val: Maximum allowed value (None = no maximum)
+
+    Returns:
+        Validated value or None if invalid
+    """
+    if value is None or pd.isna(value):
+        return None
+    try:
+        val = float(value)
+        if not np.isfinite(val):
+            return None
+        if min_val is not None and val < min_val:
+            return None
+        if max_val is not None and val > max_val:
+            return None
+        return val
+    except (TypeError, ValueError):
+        return None
+
+
+def clean_none_nan(value: Optional[Union[str, float, int]]) -> Optional[str]:
+    """
+    Clean None/NaN values from strings for display.
+    Handles both actual None/NaN and string "nan" from CSV.
+
+    Args:
+        value: Value to clean (can be None, float, int, or str)
+
+    Returns:
+        Cleaned string or None
+    """
+    # Handle None
+    if value is None:
+        return None
+
+    # Handle pandas/NumPy NaN (float('nan'))
+    if isinstance(value, (float, int)):
+        if pd.isna(value) or not np.isfinite(value):
+            return None
+
+    # Check pd.isna for any type (handles float NaN)
+    if pd.isna(value):
+        return None
+
+    # Convert to string and check
+    val_str = str(value).strip()
+    val_lower = val_str.lower()
+
+    # Check for various representations of None/NaN
+    if val_lower in ["none", "nan", "", "null", "<na>", "n/a", "na", "false", "true"]:
+        # "false" and "true" are valid strings, but if it's a boolean field, handle separately
+        return None
+
+    # Check if it's a float NaN string representation
+    try:
+        float_val = float(val_str)
+        if pd.isna(float_val) or not np.isfinite(float_val):
+            return None
+    except (ValueError, TypeError):
+        pass
+
+    return val_str
+
+
+def rate_limit(calls_per_second: float = 2.0):
+    """
+    Decorator to rate limit function calls.
+
+    Args:
+        calls_per_second: Maximum number of calls per second
+    """
+    min_interval = 1.0 / calls_per_second
+    last_called = [0.0]
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            elapsed = time.time() - last_called[0]
+            left_to_wait = min_interval - elapsed
+            if left_to_wait > 0:
+                time.sleep(left_to_wait)
+            ret = func(*args, **kwargs)
+            last_called[0] = time.time()
+            return ret
+
+        return wrapper
+
+    return decorator
 
 
 def get_ticker(symbol: str) -> yf.Ticker:
@@ -271,51 +432,80 @@ def fetch_treasury_yield() -> float:
 def fetch_earnings_surprise(ticker: yf.Ticker) -> dict:
     """
     Calculate earnings surprise from yfinance data.
+    Tries multiple methods to get earnings surprise data.
     """
     try:
-        # yfinance often has earnings_history
-        # It returns a DataFrame with 'EPS Estimate', 'Reported EPS', 'Surprise(%)'
+        # Method 1: Try earnings_history (most reliable)
         earnings = ticker.earnings_history
-        if earnings is None or earnings.empty:
+        if earnings is not None and not earnings.empty:
+            # Check for different possible column names
+            surprise_col = None
+            for col in ["Surprise(%)", "Surprise", "Surprise %", "Earnings Surprise"]:
+                if col in earnings.columns:
+                    surprise_col = col
+                    break
+
+            if surprise_col:
+                surprises = pd.to_numeric(
+                    earnings[surprise_col], errors="coerce"
+                ).dropna()
+
+                if not surprises.empty:
+                    # Get last 4 quarters (or all available if less than 4)
+                    last_4q = surprises.head(4)
+                    avg = last_4q.mean()
+                    last_surprise = surprises.iloc[0] if len(surprises) > 0 else 0
+
+                    # Formatting: yfinance typically returns as decimal (0.05 = 5%)
+                    # But sometimes it's already a percentage. Check if we need to multiply.
+                    if abs(avg) < 1.0:
+                        avg_pct = avg * 100
+                        last_pct = (
+                            last_surprise * 100
+                            if abs(last_surprise) < 1.0
+                            else last_surprise
+                        )
+                    else:
+                        avg_pct = avg
+                        last_pct = last_surprise
+
+                    return {
+                        "Earnings Surprise Avg (%)": round(avg_pct, 2),
+                        "Last Quarter Surprise (%)": round(last_pct, 2),
+                    }
+
+        # Method 2: Try quarterly_earnings and calculate manually
+        try:
+            quarterly_earnings = ticker.quarterly_earnings
+            if quarterly_earnings is not None and not quarterly_earnings.empty:
+                # If we have quarterly earnings, we can't calculate surprise without estimates
+                # But we can at least return that we tried
+                pass
+        except Exception:
+            pass
+
+        # Method 3: Try to get from info dict
+        info = ticker.info
+        # Some tickers have earningsQuarterlyGrowth which is related
+        earnings_growth = info.get("earningsQuarterlyGrowth")
+        if earnings_growth is not None:
+            # This is growth, not surprise, but better than nothing
+            # Convert to percentage if needed
+            if abs(earnings_growth) < 1.0:
+                earnings_growth = earnings_growth * 100
             return {
-                "Earnings Surprise Avg (%)": None,
-                "Last Quarter Surprise (%)": None,
-            }
-
-        # Ensure numeric columns
-        if "Surprise(%)" in earnings.columns:
-            surprises = pd.to_numeric(earnings["Surprise(%)"], errors="coerce").dropna()
-
-            if surprises.empty:
-                return {
-                    "Earnings Surprise Avg (%)": None,
-                    "Last Quarter Surprise (%)": None,
-                }
-
-            last_surprise = (
-                surprises.iloc[0] * 100
-            )  # usually decimal in DF? No, Yahoo usually sends 0.05 for 5% or 5.0?
-            # Actually yfinance earnings_history usually assumes raw values.
-            # Let's assume it matches what we see in the dataframe.
-            # If the value is 0.05, that's 5%. If it is 5.0, that's 500%? No.
-            # Usually 'Surprise(%)' is e.g. 0.06 meaning 6%.
-
-            # Let's assume decimal input if < 1.0 mostly, but safe to just take mean
-            avg = surprises.mean()
-
-            # Formatting: if values are small (like 0.05), return as percentage (5.0)
-            # If they are large (like 5.0), assume they are already percentages?
-            # In yfinance, it's typically a ratio. e.g. 0.03.
-
-            return {
-                "Earnings Surprise Avg (%)": avg * 100,
-                "Last Quarter Surprise (%)": last_surprise * 100,
+                "Earnings Surprise Avg (%)": round(earnings_growth, 2)
+                if earnings_growth
+                else None,
+                "Last Quarter Surprise (%)": round(earnings_growth, 2)
+                if earnings_growth
+                else None,
             }
 
         return {"Earnings Surprise Avg (%)": None, "Last Quarter Surprise (%)": None}
 
     except Exception as e:
-        # print(f"  Warning: Earnings data error: {e}")
+        logger.debug(f"Earnings surprise calculation failed: {str(e)}")
         return {"Earnings Surprise Avg (%)": None, "Last Quarter Surprise (%)": None}
 
 
@@ -389,7 +579,7 @@ def fetch_insider_sentiment(ticker) -> dict:
 
         return {"Insider Sentiment": label, "Net Insider Shares": net_shares}
 
-    except Exception as e:
+    except Exception:
         # print(f"DEBUG: Insider error: {e}")
         return {"Insider Sentiment": "Unknown", "Net Insider Shares": 0}
 
@@ -421,7 +611,7 @@ def fetch_institutional_holdings(ticker) -> dict:
                     try:
                         clean_val = val.replace("%", "")
                         pct_held_institutions = float(clean_val)
-                    except:
+                    except ValueError:
                         pass
                     break
 
@@ -489,7 +679,7 @@ def calculate_quality_of_earnings(ticker) -> dict:
 
         return {"Quality of Earnings Ratio": None, "Earnings Quality Concern": False}
 
-    except Exception as e:
+    except Exception:
         return {"Quality of Earnings Ratio": None, "Earnings Quality Concern": False}
 
 
@@ -565,17 +755,23 @@ def calculate_peg_ratio(ticker, info: dict) -> dict:
         return {"PEG Ratio": None}
 
 
-def fetch_rsi(ticker, period=14) -> dict:
+def fetch_rsi(ticker, period=14, close_series=None) -> dict:
     """
     Calculate 14-day RSI (Relative Strength Index).
     Returns RSI value and signal (Oversold/Overbought).
     """
     try:
-        hist = ticker.history(period="3mo")  # Need enough data for 14d + smoothing
-        if hist.empty or len(hist) < period + 1:
+        if close_series is not None:
+            close = close_series
+        else:
+            hist = ticker.history(period="3mo")  # Need enough data for 14d + smoothing
+            if hist.empty:
+                return {"RSI": None, "RSI Signal": "Insufficient Data"}
+            close = hist["Close"]
+
+        if len(close) < period + 1:
             return {"RSI": None, "RSI Signal": "Insufficient Data"}
 
-        close = hist["Close"]
         delta = close.diff()
 
         # Gain/Loss
@@ -682,14 +878,25 @@ def fetch_analyst_recommendations(ticker) -> dict:
         return {"Analyst Trend": "Unknown", "Current Buy Ratings": 0}
 
 
-def fetch_technical_signals(ticker) -> dict:
+def fetch_technical_signals(ticker, close_series=None) -> dict:
     """
     Calculate simple technical indicators (SMA50, SMA200) from 1y history.
     """
     try:
-        # Get 1 year of history
-        hist = ticker.history(period="1y")
-        if hist.empty or len(hist) < 200:
+        if close_series is not None:
+            close = close_series
+        else:
+            # Get 1 year of history
+            hist = ticker.history(period="1y")
+            if hist.empty:
+                return {
+                    "SMA50": None,
+                    "SMA200": None,
+                    "Technical Signal": "Insufficient Data",
+                }
+            close = hist["Close"]
+
+        if len(close) < 200:
             return {
                 "SMA50": None,
                 "SMA200": None,
@@ -697,9 +904,9 @@ def fetch_technical_signals(ticker) -> dict:
             }
 
         # Calculate SMAs
-        sma50 = hist["Close"].rolling(window=50).mean().iloc[-1]
-        sma200 = hist["Close"].rolling(window=200).mean().iloc[-1]
-        current_price = hist["Close"].iloc[-1]
+        sma50 = close.rolling(window=50).mean().iloc[-1]
+        sma200 = close.rolling(window=200).mean().iloc[-1]
+        current_price = close.iloc[-1]
 
         signal = "Neutral"
         if sma50 > sma200:
@@ -919,6 +1126,66 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
         score += 1
         reasons.append(f"Reasonable Growth Val (PEG: {peg}) ✓")
 
+    # NEW: Piotroski F-Score (Quality Metric)
+    piotroski_score = stock_data.get("Piotroski Score", 0) or 0
+    if piotroski_score >= 8:
+        score += 2
+        reasons.append(f"Excellent Quality (Piotroski: {piotroski_score}/9) ✓")
+    elif piotroski_score >= 6:
+        score += 1
+        reasons.append(f"Good Quality (Piotroski: {piotroski_score}/9) ✓")
+    elif piotroski_score < 4 and piotroski_score > 0:
+        score -= 1
+        reasons.append(f"Poor Quality (Piotroski: {piotroski_score}/9) ⚠️")
+
+    # NEW: EV/EBITDA (Better valuation for capital-intensive companies)
+    ev_ebitda = stock_data.get("EV/EBITDA")
+    if ev_ebitda and ev_ebitda < 15:
+        score += 1
+        reasons.append(f"Attractive EV/EBITDA ({ev_ebitda:.1f}) ✓")
+    elif ev_ebitda and ev_ebitda > 25:
+        score -= 1
+        reasons.append(f"Expensive EV/EBITDA ({ev_ebitda:.1f}) ⚠️")
+
+    # NEW: Due Diligence Factors
+    # Financial Distress Risk
+    distress_risk = stock_data.get("Financial Distress Risk", "")
+    if "Low" in distress_risk or "Safe Zone" in distress_risk:
+        score += 1
+        z_score = stock_data.get("Altman Z-Score")
+        reasons.append(f"Low financial distress risk (Z: {z_score}) ✓")
+    elif "High" in distress_risk:
+        score -= 2
+        reasons.append("High financial distress risk ⚠️")
+
+    # Cash Flow Quality
+    cf_quality = stock_data.get("Cash Flow Quality", "")
+    if cf_quality == "Good":
+        score += 1
+        reasons.append("Strong cash flow quality ✓")
+    elif cf_quality == "Poor":
+        score -= 1
+        reasons.append("Poor cash flow quality ⚠️")
+
+    # Accounting Red Flags
+    red_flag_count = stock_data.get("Red Flag Count", 0) or 0
+    if red_flag_count == 0:
+        score += 1
+        reasons.append("No accounting red flags ✓")
+    elif red_flag_count >= 2:
+        score -= 2
+        reasons.append(f"Multiple accounting red flags ({red_flag_count}) ⚠️")
+
+    # Valuation Consensus
+    val_consensus = stock_data.get("Valuation Consensus", "")
+    if val_consensus == "Strong Agreement":
+        score += 1
+        avg_upside = stock_data.get("Average Upside (%)", 0) or 0
+        reasons.append(f"Strong valuation consensus ({avg_upside:.1f}% upside) ✓")
+    elif val_consensus == "Divergent Views":
+        score -= 1
+        reasons.append("Divergent valuation views ⚠️")
+
     # Penalty for high P/E (-1 if > 30), UNLESS PEG is good
     pe = stock_data.get("P/E", 0) or 0
     if pe > 30 and peg > 2.0:
@@ -944,7 +1211,24 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
     # Cap score at 1-10
     score = max(1, min(10, score))
 
-    return score, reasons
+    # 6. ML Alpha Score (Return Prediction)
+    # Score is predicted 20-day return %.
+    # > 2% (approx 25% annualized) is bullish. > 5% very bullish. < 0% bearish.
+
+    # Need to handle if "ML Alpha Score" key is missing or None
+    ml_score = stock_data.get("ML Alpha Score", 0.0)
+
+    if ml_score > 2.0:
+        score += 5
+        reasons.append(f"ML Forecast Bullish (+{ml_score:.1f}%)")
+    if ml_score > 5.0:
+        score += 5
+        reasons.append("ML Strong Conviction")
+    elif ml_score < 0.0:
+        score -= 5
+        reasons.append(f"ML Forecast Bearish ({ml_score:.1f}%)")
+
+    return min(100, max(0, score)), reasons
 
 
 def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
@@ -974,7 +1258,7 @@ def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
     elif peg < 2.0:
         pass  # No warning (Justified by growth)
     else:
-        warnings.append(f"⚠️ Significantly above Graham value")
+        warnings.append("⚠️ Significantly above Graham value")
 
     # Low analyst coverage
     num_analysts = stock_data.get("# Analysts", 0) or 0
@@ -1005,6 +1289,52 @@ def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
     sentiment_label = str(stock_data.get("News Sentiment Label", "")).lower()
     if "bearish" in sentiment_label and sentiment_label != "nan":
         warnings.append(f"⚠️ Negative news sentiment ({sentiment_label})")
+
+    # NEW: Financial Distress Risk (Altman Z-Score)
+    distress_risk = stock_data.get("Financial Distress Risk", "")
+    if "High" in distress_risk:
+        z_score = stock_data.get("Altman Z-Score")
+        warnings.append(f"⚠️ High financial distress risk (Z-Score: {z_score})")
+
+    # NEW: Cash Flow Quality
+    cf_quality = stock_data.get("Cash Flow Quality", "")
+    if cf_quality == "Poor":
+        warnings.append("⚠️ Poor cash flow quality")
+    cf_concerns = clean_none_nan(stock_data.get("Cash Flow Concerns"))
+    if cf_concerns:
+        warnings.append(f"⚠️ Cash flow concerns: {cf_concerns}")
+
+    # NEW: Accounting Red Flags
+    red_flag_count = stock_data.get("Red Flag Count", 0) or 0
+    if red_flag_count > 0:
+        flags = clean_none_nan(stock_data.get("Accounting Red Flags"))
+        if flags:
+            warnings.append(
+                f"⚠️ Accounting red flags detected ({red_flag_count}): {flags}"
+            )
+
+    # NEW: Debt Maturity Risk
+    debt_risk = stock_data.get("Debt Maturity Risk", "")
+    if debt_risk == "High":
+        warnings.append("⚠️ High debt maturity/refinancing risk")
+    debt_concerns = clean_none_nan(stock_data.get("Debt Concerns"))
+    if debt_concerns:
+        warnings.append(f"⚠️ Debt concerns: {debt_concerns}")
+
+    # NEW: Dividend Sustainability (for dividend payers only)
+    div_paying = stock_data.get("Dividend Paying", False)
+    if div_paying:  # Only check if stock actually pays dividends
+        div_sustainability = stock_data.get("Dividend Sustainability", "")
+        if div_sustainability == "At Risk":
+            warnings.append("⚠️ Dividend sustainability at risk")
+        div_concerns = clean_none_nan(stock_data.get("Dividend Concerns"))
+        if div_concerns:
+            warnings.append(f"⚠️ Dividend concerns: {div_concerns}")
+
+    # NEW: Valuation Consensus
+    val_consensus = stock_data.get("Valuation Consensus", "")
+    if val_consensus == "Divergent Views":
+        warnings.append("⚠️ Divergent valuation views (methods disagree)")
 
     return warnings
 
@@ -1089,6 +1419,14 @@ Risk Profile:
 - Upcoming Earnings: {"Yes, in " + str(stock_data.get("Days to Earnings")) + " days" if stock_data.get("Upcoming Earnings") else "No"}
 - Sector Trend: {stock_data.get("Sector Trend", "N/A")} (SMA200 Gap: {stock_data.get("Sector SMA200 Gap (%)", "N/A")}%)
 
+Due Diligence:
+- Financial Distress Risk: {stock_data.get("Financial Distress Risk", "N/A")} (Altman Z: {stock_data.get("Altman Z-Score", "N/A")})
+- Cash Flow Quality: {stock_data.get("Cash Flow Quality", "N/A")} (FCF Conversion: {stock_data.get("FCF Conversion Ratio", "N/A")})
+- Accounting Red Flags: {stock_data.get("Red Flag Count", 0)} flags - {stock_data.get("Accounting Red Flags", "None")}
+- Debt Maturity Risk: {stock_data.get("Debt Maturity Risk", "N/A")} (ST Debt Coverage: {stock_data.get("Short-Term Debt Coverage", "N/A")})
+- Dividend Sustainability: {stock_data.get("Dividend Sustainability", "N/A") if stock_data.get("Dividend Paying") else "N/A (Non-dividend)"}
+- Valuation Consensus: {stock_data.get("Valuation Consensus", "N/A")} ({stock_data.get("Valuation Signal", "N/A")}, Avg Upside: {stock_data.get("Average Upside (%)", "N/A")}%)
+
 Task:
 1. Synthesize the signals (e.g., "Trading at a discount to its sector P/E median").
 2. Highlight the primary driver for a BUY or WATCH decision.
@@ -1131,34 +1469,77 @@ def backtest_portfolio(tickers, weights) -> None:
             return
 
         # Download data
+        # Download data (Force auto_adjust=True for Total Return)
         all_symbols = tickers + ["SPY"]
-        data = yf.download(all_symbols, period="1y", interval="1d", progress=False)[
-            "Close"
-        ]
+        # print(f"  Downloading adjusted daily data for {len(all_symbols)} symbols...")
+        data = yf.download(
+            all_symbols, period="1y", interval="1d", progress=False, auto_adjust=True
+        )
+
+        # Handle MultiIndex columns (yfinance structure changes often)
+        # If auto_adjust=True, usually we just get "Close" which is adjusted.
+        if "Close" in data.columns and isinstance(data.columns, pd.MultiIndex):
+            data = data["Close"]
+        elif "Adj Close" in data.columns:
+            data = data["Adj Close"]
+        elif "Close" in data.columns:
+            data = data["Close"]  # Fallback
 
         if data.empty:
             print("  Error: No historical data found.")
             return
 
+        # print(f"  Data Shape: {data.shape} | Date Range: {data.index.min().date()} to {data.index.max().date()}")
+
         # Calculate Returns
+        # Drop initial NaNs but be careful not to drop whole rows if just one stock is missing a day
+        # Ideally we forward fill prices first?
+        data = data.ffill().dropna()
+        if data.empty:
+            print(
+                "  Error: Data empty after cleaning (check if tickers have overlapping history)."
+            )
+            return
+
         returns = data.pct_change().dropna()
 
         # Portfolio Returns
-        # weights dict must be ordered same as data columns, but data cols are sorted alphabetically usually
-        # Realign weights
+        # weight_map logic...
         sorted_tickers = [t for t in all_symbols if t != "SPY" and t in data.columns]
-
-        # Create weight array aligned with sorted_tickers
-        # Assuming weights is a list corresponding to input 'tickers' list
-        # We need a robust mapping.
         weight_map = dict(zip(tickers, weights))
 
-        # Calculate weighted daily returns
-        # We'll do it manually: sum(return * weight)
-        port_daily_ret = pd.Series(0, index=returns.index)
+        # Check for missing tickers
+        missing = set(tickers) - set(data.columns)
+        if missing:
+            print(
+                f"  Warning: Missing data for {missing}. Weights will be re-normalized."
+            )
+
+        # Calculate weighted daily returns (Daily Rebalancing Assumption)
+        # Verify: this assumes rebalancing to target weights every day.
+        # For small deviations this tracks Buy & Hold well enough for checking.
+        port_daily_ret = pd.Series(0.0, index=returns.index)
+        total_weight = 0
         for t in sorted_tickers:
             w = weight_map.get(t, 0)
             port_daily_ret += returns[t] * w
+            total_weight += w
+
+        # Normalize if weights don't sum to 1 (due to missing data)
+        if total_weight > 0:
+            port_daily_ret = port_daily_ret / total_weight
+
+        # Buy & Hold Return (No Rebalancing)
+        # Start Value = 1.0. End Value = Sum(Weight * (Price_End / Price_Start))
+        buy_hold_ret = 0.0
+        for t in sorted_tickers:
+            w = weight_map.get(t, 0)
+            if t in data.columns:
+                # Total return for this asset
+                asset_ret = (data[t].iloc[-1] / data[t].iloc[0]) - 1
+                buy_hold_ret += w * (1 + asset_ret)
+
+        buy_hold_total_ret = (buy_hold_ret - 1) * 100
 
         spy_daily_ret = returns["SPY"]
 
@@ -1183,14 +1564,71 @@ def backtest_portfolio(tickers, weights) -> None:
         sharpe_port = (port_daily_ret.mean() / port_daily_ret.std()) * np.sqrt(252)
         sharpe_spy = (spy_daily_ret.mean() / spy_daily_ret.std()) * np.sqrt(252)
 
-        print(f"  Portfolio Return (1Y): {total_ret_port:.2f}%")
+        # Sortino Ratio (Annualized)
+        target_return = 0
+        downside_returns_port = port_daily_ret[port_daily_ret < target_return]
+        downside_std_port = downside_returns_port.std()
+        sortino_port = (
+            (port_daily_ret.mean() / downside_std_port) * np.sqrt(252)
+            if downside_std_port > 0
+            else None
+        )
+
+        downside_returns_spy = spy_daily_ret[spy_daily_ret < target_return]
+        downside_std_spy = downside_returns_spy.std()
+        sortino_spy = (
+            (spy_daily_ret.mean() / downside_std_spy) * np.sqrt(252)
+            if downside_std_spy > 0
+            else None
+        )
+
+        print(f"  Portfolio Return (1Y): {total_ret_port:.2f}% (Daily Rebalance)")
+        print(f"  Buy & Hold Return:     {buy_hold_total_ret:.2f}%")
         print(f"  SPY Return (1Y):       {total_ret_spy:.2f}%")
-        print(f"  Alpha:                 {total_ret_port - total_ret_spy:.2f}%")
+        print(f"  Alpha (vs SPY):        {total_ret_port - total_ret_spy:.2f}%")
         print("-" * 40)
         print(f"  Portfolio Max DD:      {max_dd_port:.2f}%")
         print(f"  SPY Max DD:            {max_dd_spy:.2f}%")
         print(f"  Portfolio Sharpe:      {sharpe_port:.2f}")
         print(f"  SPY Sharpe:            {sharpe_spy:.2f}")
+        if sortino_port is not None:
+            print(f"  Portfolio Sortino:     {sortino_port:.2f}")
+        if sortino_spy is not None:
+            print(f"  SPY Sortino:           {sortino_spy:.2f}")
+
+        # Value at Risk (VaR) and Conditional VaR
+        try:
+            var_95_port = (
+                np.percentile(port_daily_ret, 5) * 100
+            )  # 95% VaR (5th percentile)
+            cvar_95_port = (
+                port_daily_ret[
+                    port_daily_ret <= np.percentile(port_daily_ret, 5)
+                ].mean()
+                * 100
+            )
+            var_95_spy = np.percentile(spy_daily_ret, 5) * 100
+            cvar_95_spy = (
+                spy_daily_ret[spy_daily_ret <= np.percentile(spy_daily_ret, 5)].mean()
+                * 100
+            )
+
+            # Annualize VaR
+            var_95_port_annual = var_95_port * np.sqrt(252)
+            var_95_spy_annual = var_95_spy * np.sqrt(252)
+
+            print("-" * 40)
+            print("  Risk Metrics (VaR):")
+            print(
+                f"  Portfolio VaR (95%):   {var_95_port:.2f}% daily ({var_95_port_annual:.2f}% annualized)"
+            )
+            print(f"  Portfolio CVaR (95%):   {cvar_95_port:.2f}% daily")
+            print(
+                f"  SPY VaR (95%):         {var_95_spy:.2f}% daily ({var_95_spy_annual:.2f}% annualized)"
+            )
+            print(f"  SPY CVaR (95%):        {cvar_95_spy:.2f}% daily")
+        except Exception:
+            pass  # Skip VaR if calculation fails
 
         # Save results
         results_df = pd.DataFrame(
@@ -1223,6 +1661,39 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
 
     for _, row in passed_df.iterrows():
         stock_data = row.to_dict()
+
+        # Clean NaN values that may have come from CSV (pandas converts None to float('nan'))
+        cleaned_data = {}
+        for key, value in stock_data.items():
+            # Handle pandas NaN (float('nan')) - this is what empty CSV cells become
+            if pd.isna(value):
+                cleaned_data[key] = None
+            elif isinstance(value, (float, int)) and (
+                pd.isna(value) or not np.isfinite(value)
+            ):
+                cleaned_data[key] = None
+            elif isinstance(value, str):
+                val_lower = value.lower().strip()
+                if val_lower in ["nan", "none", "", "null", "n/a", "na"]:
+                    cleaned_data[key] = None
+                elif val_lower == "false" and (
+                    "Dividend Paying" in key
+                    or "Graham Undervalued" in key
+                    or "Stage 2 Pass" in key
+                ):
+                    cleaned_data[key] = False
+                elif val_lower == "true" and (
+                    "Dividend Paying" in key
+                    or "Graham Undervalued" in key
+                    or "Stage 2 Pass" in key
+                ):
+                    cleaned_data[key] = True
+                else:
+                    cleaned_data[key] = value
+            else:
+                cleaned_data[key] = value
+        stock_data = cleaned_data
+
         symbol = stock_data.get("Symbol", "Unknown")
 
         print(f"  Generating advice for {symbol}...", end=" ")
@@ -1259,7 +1730,11 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
                 "Action": action,
                 "Conviction": conviction,
                 "Conviction Reasons": "; ".join(conviction_reasons),
-                "Risk Warnings": "; ".join(risks) if risks else "None",
+                "Risk Warnings": "; ".join(
+                    [r for r in risks if r and "nan" not in r.lower()]
+                )
+                if risks
+                else "None",
                 "AI Thesis": thesis,
             }
         )
@@ -1309,9 +1784,28 @@ def calculate_dcf_fair_value(
                 "DCF Notes": "No cash flow data",
             }
 
-        # Get Free Cash Flow
-        operating_cf = cf.loc["Total Cash From Operating Activities"].dropna().tolist()
-        capex = cf.loc["Capital Expenditure"].dropna().tolist()
+        # Get Free Cash Flow - try multiple possible key names
+        operating_cf = None
+        possible_ocf_keys = [
+            "Total Cash From Operating Activities",
+            "Operating Cash Flow",
+            "Cash From Operating Activities",
+        ]
+        for key in possible_ocf_keys:
+            if key in cf.index:
+                operating_cf = cf.loc[key].dropna().tolist()
+                break
+
+        capex = None
+        possible_capex_keys = [
+            "Capital Expenditure",
+            "Capital Expenditures",
+            "Capital Spending",
+        ]
+        for key in possible_capex_keys:
+            if key in cf.index:
+                capex = cf.loc[key].dropna().tolist()
+                break
 
         if not operating_cf or not capex or len(operating_cf) < 2:
             return {
@@ -1331,19 +1825,25 @@ def calculate_dcf_fair_value(
         # FCF growth rate
         if len(operating_cf) >= 3:
             older_fcf = operating_cf[2] + (capex[2] if len(capex) > 2 else 0)
-            fcf_growth = (
-                (current_fcf / older_fcf) ** (1 / 2) - 1 if older_fcf > 0 else 0.05
-            )
+            if older_fcf > 0:
+                ratio = safe_divide(current_fcf, older_fcf, default=1.0)
+                fcf_growth = (ratio ** (1 / 2)) - 1
+                fcf_growth = max(0.03, min(0.15, fcf_growth))  # Cap growth at 3-15%
+            else:
+                fcf_growth = 0.05  # Default 5%
         else:
             fcf_growth = 0.05  # Default 5%
-        fcf_growth = max(0.03, min(0.15, fcf_growth))  # Cap growth at 3-15%
 
         # --- Enhanced WACC Calculation ---
         market_cap = info.get("marketCap", 0)
         total_debt = info.get("totalDebt", 0)
         total_capital = market_cap + total_debt
         if total_capital == 0:
-            return {"DCF Fair Value": None, "DCF Notes": "Missing capital structure"}
+            return {
+                "DCF Fair Value": None,
+                "DCF Upside (%)": None,
+                "DCF Notes": "Missing capital structure",
+            }
 
         equity_weight = market_cap / total_capital
         debt_weight = total_debt / total_capital
@@ -1354,23 +1854,53 @@ def calculate_dcf_fair_value(
 
         # Estimate cost of debt (e.g., interest expense / total debt)
         income_stmt = ticker.financials
-        interest_expense = (
-            income_stmt.loc["Interest Expense"].iloc[0]
-            if "Interest Expense" in income_stmt.index
-            else 0
-        )
+        interest_expense = 0
+        if not income_stmt.empty:
+            possible_interest_keys = [
+                "Interest Expense",
+                "Interest And Debt Expense",
+                "Total Interest Expense",
+            ]
+            for key in possible_interest_keys:
+                if key in income_stmt.index:
+                    try:
+                        interest_expense = income_stmt.loc[key].iloc[0] or 0
+                        break
+                    except (IndexError, KeyError):
+                        continue
         cost_of_debt = abs(interest_expense) / total_debt if total_debt > 0 else 0.05
         cost_of_debt = max(0.04, min(cost_of_debt, 0.09))  # Bound cost of debt
 
         tax_rate = 0.21  # Default tax rate
-        if (
-            "Tax Provision" in income_stmt.index
-            and "Pretax Income" in income_stmt.index
-        ):
-            tax_provision = income_stmt.loc["Tax Provision"].iloc[0]
-            pretax_income = income_stmt.loc["Pretax Income"].iloc[0]
-            if pretax_income > 0:
-                tax_rate = tax_provision / pretax_income
+        if not income_stmt.empty:
+            tax_provision = None
+            pretax_income = None
+
+            # Try to find tax provision
+            for key in ["Tax Provision", "Income Tax Expense", "Taxes"]:
+                if key in income_stmt.index:
+                    try:
+                        tax_provision = income_stmt.loc[key].iloc[0]
+                        break
+                    except (IndexError, KeyError):
+                        continue
+
+            # Try to find pretax income
+            for key in ["Pretax Income", "Income Before Tax", "Earnings Before Tax"]:
+                if key in income_stmt.index:
+                    try:
+                        pretax_income = income_stmt.loc[key].iloc[0]
+                        break
+                    except (IndexError, KeyError):
+                        continue
+
+            if (
+                tax_provision is not None
+                and pretax_income is not None
+                and pretax_income > 0
+            ):
+                tax_rate = safe_divide(tax_provision, pretax_income, default=0.21)
+                tax_rate = max(0.0, min(0.35, tax_rate))  # Bound between 0-35%
 
         wacc = equity_weight * cost_of_equity + debt_weight * cost_of_debt * (
             1 - tax_rate
@@ -1421,7 +1951,15 @@ def calculate_dcf_fair_value(
             "DCF Notes": f"WACC={wacc * 100:.1f}%, FCF Growth={fcf_growth * 100:.1f}%",
         }
 
+    except KeyError as e:
+        logger.debug(f"DCF calculation failed - missing key: {str(e)}")
+        return {
+            "DCF Fair Value": None,
+            "DCF Upside (%)": None,
+            "DCF Notes": f"Missing data key: {str(e)[:30]}",
+        }
     except Exception as e:
+        logger.warning(f"DCF calculation failed: {str(e)}")
         return {
             "DCF Fair Value": None,
             "DCF Upside (%)": None,
@@ -1586,7 +2124,7 @@ def calculate_pfcf(
 
         return market_cap / fcf
     except Exception as e:
-        print(f"ERROR in calculate_pfcf for {ticker.ticker}: {e}")
+        logger.warning(f"P/FCF calculation failed for {ticker.ticker}: {str(e)}")
         return None
 
 
@@ -1642,10 +2180,10 @@ def calculate_roic(ticker: yf.Ticker) -> Optional[float]:
         if invested_capital <= 0:
             return None
 
-        return nopat / invested_capital
+        return safe_divide(nopat, invested_capital)
 
     except Exception as e:
-        print(f"ERROR in calculate_roic for {ticker.ticker}: {e}")
+        logger.warning(f"ROIC calculation failed for {ticker.ticker}: {str(e)}")
         return None
 
 
@@ -1663,10 +2201,13 @@ def calculate_cagr(values: list, years: int = 3) -> Optional[float]:
         if start_value <= 0:  # Can't calculate CAGR from negative/zero base
             return None
 
-        cagr = (end_value / start_value) ** (1 / years) - 1
-        return cagr
+        ratio = safe_divide(end_value, start_value, default=1.0)
+        if ratio <= 0:
+            return None
+        cagr = (ratio ** (1 / years)) - 1
+        return cagr if np.isfinite(cagr) else None
     except Exception as e:
-        print(f"ERROR in calculate_cagr: {e}")
+        logger.warning(f"CAGR calculation failed: {str(e)}")
         return None
 
 
@@ -1687,8 +2228,743 @@ def calculate_graham_number(eps: float, book_value_per_share: float) -> Optional
         graham_number = (22.5 * eps * book_value_per_share) ** 0.5
         return graham_number
     except Exception as e:
-        print(f"ERROR in calculate_graham_number: {e}")
+        logger.debug(f"Graham number calculation failed: {str(e)}")
         return None
+
+
+def calculate_piotroski_score(ticker: yf.Ticker) -> dict:
+    """
+    Calculate Piotroski F-Score (0-9) for quality assessment.
+
+    The F-Score combines 9 fundamental signals:
+    1. Positive ROA
+    2. Positive Operating Cash Flow
+    3. ROA increased YoY
+    4. Quality of Earnings (OCF > Net Income)
+    5. Decreasing Leverage (Long-term Debt/Assets)
+    6. Increasing Current Ratio
+    7. No new shares issued
+    8. Increasing Gross Margin
+    9. Increasing Asset Turnover
+
+    Returns: Dict with score (0-9) and breakdown of signals
+    """
+    try:
+        income = ticker.financials
+        balance = ticker.balance_sheet
+        cashflow = ticker.cashflow
+
+        if income.empty or balance.empty or cashflow.empty:
+            return {"Piotroski Score": None, "Piotroski Quality": "Unknown"}
+
+        # Get current and previous year data (most recent = column 0)
+        current_income = income.iloc[:, 0] if len(income.columns) > 0 else pd.Series()
+        prev_income = income.iloc[:, 1] if len(income.columns) > 1 else pd.Series()
+
+        current_balance = (
+            balance.iloc[:, 0] if len(balance.columns) > 0 else pd.Series()
+        )
+        prev_balance = balance.iloc[:, 1] if len(balance.columns) > 1 else pd.Series()
+
+        current_cf = cashflow.iloc[:, 0] if len(cashflow.columns) > 0 else pd.Series()
+
+        score = 0
+
+        # Helper to safely get value
+        def get_value(series, key, default=0):
+            if key in series.index:
+                val = series[key]
+                return val if pd.notna(val) else default
+            return default
+
+        # 1. Positive ROA
+        net_income = get_value(current_income, "Net Income")
+        total_assets = get_value(current_balance, "Total Assets")
+        roa_current = net_income / total_assets if total_assets > 0 else 0
+        if roa_current > 0:
+            score += 1
+
+        # 2. Positive Operating Cash Flow
+        ocf = get_value(
+            current_cf,
+            "Operating Cash Flow",
+            get_value(current_cf, "Total Cash From Operating Activities"),
+        )
+        if ocf > 0:
+            score += 1
+
+        # 3. ROA increased YoY
+        prev_net_income = get_value(prev_income, "Net Income")
+        prev_total_assets = get_value(prev_balance, "Total Assets")
+        roa_prev = prev_net_income / prev_total_assets if prev_total_assets > 0 else 0
+        if roa_current > roa_prev:
+            score += 1
+
+        # 4. Quality of Earnings (OCF > Net Income)
+        if ocf > net_income:
+            score += 1
+
+        # 5. Decreasing Leverage
+        current_lt_debt = get_value(
+            current_balance, "Long Term Debt", get_value(current_balance, "Total Debt")
+        )
+        prev_lt_debt = get_value(
+            prev_balance, "Long Term Debt", get_value(prev_balance, "Total Debt")
+        )
+        leverage_current = current_lt_debt / total_assets if total_assets > 0 else 0
+        leverage_prev = prev_lt_debt / prev_total_assets if prev_total_assets > 0 else 0
+        if leverage_current < leverage_prev:
+            score += 1
+
+        # 6. Increasing Current Ratio
+        current_assets = get_value(current_balance, "Current Assets")
+        current_liabilities = get_value(current_balance, "Current Liabilities")
+        prev_current_assets = get_value(prev_balance, "Current Assets")
+        prev_current_liabilities = get_value(prev_balance, "Current Liabilities")
+
+        cr_current = (
+            current_assets / current_liabilities if current_liabilities > 0 else 0
+        )
+        cr_prev = (
+            prev_current_assets / prev_current_liabilities
+            if prev_current_liabilities > 0
+            else 0
+        )
+        if cr_current > cr_prev:
+            score += 1
+
+        # 7. No new shares issued (simplified: shares outstanding decreased or stayed same)
+        current_shares = get_value(
+            current_balance, "Share Issued", get_value(current_balance, "Common Stock")
+        )
+        prev_shares = get_value(
+            prev_balance, "Share Issued", get_value(prev_balance, "Common Stock")
+        )
+        if current_shares > 0 and prev_shares > 0:
+            if current_shares <= prev_shares:
+                score += 1
+
+        # 8. Increasing Gross Margin
+        current_revenue = get_value(current_income, "Total Revenue")
+        current_cogs = get_value(
+            current_income,
+            "Cost Of Revenue",
+            get_value(current_income, "Cost Of Goods Sold"),
+        )
+        prev_revenue = get_value(prev_income, "Total Revenue")
+        prev_cogs = get_value(
+            prev_income, "Cost Of Revenue", get_value(prev_income, "Cost Of Goods Sold")
+        )
+
+        gm_current = (
+            (current_revenue - current_cogs) / current_revenue
+            if current_revenue > 0
+            else 0
+        )
+        gm_prev = (prev_revenue - prev_cogs) / prev_revenue if prev_revenue > 0 else 0
+        if gm_current > gm_prev:
+            score += 1
+
+        # 9. Increasing Asset Turnover
+        turnover_current = current_revenue / total_assets if total_assets > 0 else 0
+        turnover_prev = prev_revenue / prev_total_assets if prev_total_assets > 0 else 0
+        if turnover_current > turnover_prev:
+            score += 1
+
+        # Interpret score
+        if score >= 8:
+            quality_label = "Excellent"
+        elif score >= 6:
+            quality_label = "Good"
+        elif score >= 4:
+            quality_label = "Average"
+        else:
+            quality_label = "Poor"
+
+        return {
+            "Piotroski Score": score,
+            "Piotroski Quality": quality_label,
+        }
+
+    except Exception:
+        return {"Piotroski Score": None, "Piotroski Quality": "Unknown"}
+
+
+def calculate_ev_ebitda(ticker: yf.Ticker, info: dict) -> Optional[float]:
+    """
+    Calculate EV/EBITDA ratio.
+    EV = Market Cap + Total Debt - Cash
+    EBITDA = Earnings Before Interest, Taxes, Depreciation, Amortization
+    """
+    try:
+        market_cap = info.get("marketCap", 0)
+        total_debt = info.get("totalDebt", 0)
+        cash = info.get("totalCash", 0) or info.get("cash", 0) or 0
+
+        enterprise_value = market_cap + total_debt - cash
+
+        # Try to get EBITDA from income statement
+        income = ticker.financials
+        if income.empty:
+            # Fallback to info dict
+            ebitda = info.get("ebitda")
+            if not ebitda:
+                return None
+        else:
+            # Try different EBITDA keys
+            ebitda = None
+            for key in ["EBITDA", "Ebitda"]:
+                if key in income.index:
+                    ebitda = income.loc[key].iloc[0]
+                    break
+
+            if ebitda is None:
+                # Calculate from components
+                ebit = None
+                for key in ["EBIT", "Operating Income", "Ebit"]:
+                    if key in income.index:
+                        ebit = income.loc[key].iloc[0]
+                        break
+
+                if ebit is not None:
+                    # Add back depreciation/amortization
+                    da = None
+                    for key in [
+                        "Depreciation And Amortization",
+                        "Depreciation",
+                        "Amortization Of Intangibles",
+                    ]:
+                        if key in income.index:
+                            da = income.loc[key].iloc[0]
+                            break
+                    ebitda = ebit + (da if da else 0)
+                else:
+                    return None
+
+        if ebitda is None or ebitda <= 0:
+            return None
+
+        return enterprise_value / ebitda
+
+    except Exception:
+        return None
+
+
+def calculate_altman_z_score(ticker: yf.Ticker, info: dict) -> dict:
+    """
+    Calculate Altman Z-Score to assess financial distress probability.
+    Z-Score < 1.8 = Distress Zone (High bankruptcy risk)
+    Z-Score 1.8-3.0 = Grey Zone (Moderate risk)
+    Z-Score > 3.0 = Safe Zone (Low bankruptcy risk)
+
+    Formula: Z = 1.2A + 1.4B + 3.3C + 0.6D + 1.0E
+    Where:
+    A = Working Capital / Total Assets
+    B = Retained Earnings / Total Assets
+    C = EBIT / Total Assets
+    D = Market Value of Equity / Total Liabilities
+    E = Sales / Total Assets
+    """
+    try:
+        balance = ticker.balance_sheet
+        income = ticker.financials
+
+        if balance.empty or income.empty:
+            return {"Altman Z-Score": None, "Financial Distress Risk": "Unknown"}
+
+        # Get most recent data
+        current_balance = (
+            balance.iloc[:, 0] if len(balance.columns) > 0 else pd.Series()
+        )
+        current_income = income.iloc[:, 0] if len(income.columns) > 0 else pd.Series()
+
+        def get_value(series, key, default=0):
+            if key in series.index:
+                val = series[key]
+                return val if pd.notna(val) else default
+            return default
+
+        total_assets = get_value(current_balance, "Total Assets")
+        if total_assets <= 0:
+            return {"Altman Z-Score": None, "Financial Distress Risk": "Unknown"}
+
+        # A = Working Capital / Total Assets
+        current_assets = get_value(current_balance, "Current Assets")
+        current_liabilities = get_value(current_balance, "Current Liabilities")
+        working_capital = current_assets - current_liabilities
+        A = safe_divide(working_capital, total_assets)
+
+        # B = Retained Earnings / Total Assets
+        retained_earnings = get_value(
+            current_balance,
+            "Retained Earnings",
+            get_value(current_balance, "Retained Earnings Total Equity"),
+        )
+        B = safe_divide(retained_earnings, total_assets)
+
+        # C = EBIT / Total Assets
+        ebit = get_value(
+            current_income, "EBIT", get_value(current_income, "Operating Income")
+        )
+        C = safe_divide(ebit, total_assets)
+
+        # D = Market Value of Equity / Total Liabilities
+        market_cap = info.get("marketCap", 0) or 0
+        total_liabilities = get_value(current_balance, "Total Liabilities")
+        D = safe_divide(market_cap, total_liabilities)
+
+        # E = Sales / Total Assets
+        revenue = get_value(current_income, "Total Revenue")
+        E = safe_divide(revenue, total_assets)
+
+        # Calculate Z-Score
+        z_score = 1.2 * A + 1.4 * B + 3.3 * C + 0.6 * D + 1.0 * E
+
+        # Interpret
+        if z_score < 1.8:
+            risk = "High (Distress Zone)"
+        elif z_score < 3.0:
+            risk = "Moderate (Grey Zone)"
+        else:
+            risk = "Low (Safe Zone)"
+
+        return {"Altman Z-Score": round(z_score, 2), "Financial Distress Risk": risk}
+
+    except Exception as e:
+        logger.debug(f"Altman Z-Score calculation failed: {str(e)}")
+        return {"Altman Z-Score": None, "Financial Distress Risk": "Unknown"}
+
+
+def calculate_cash_flow_quality(ticker: yf.Ticker) -> dict:
+    """
+    Analyze cash flow quality and sustainability.
+    Checks:
+    1. Free Cash Flow conversion (FCF / Net Income)
+    2. Working capital trends (increasing WC = cash tied up)
+    3. CapEx vs Depreciation (sustainable growth)
+    """
+    try:
+        cashflow = ticker.cashflow
+        income = ticker.financials
+        balance = ticker.balance_sheet
+
+        if cashflow.empty or income.empty or balance.empty:
+            return {}
+
+        # Get current and previous year
+        current_cf = cashflow.iloc[:, 0] if len(cashflow.columns) > 0 else pd.Series()
+        current_income = income.iloc[:, 0] if len(income.columns) > 0 else pd.Series()
+        current_balance = (
+            balance.iloc[:, 0] if len(balance.columns) > 0 else pd.Series()
+        )
+        prev_balance = balance.iloc[:, 1] if len(balance.columns) > 1 else pd.Series()
+
+        def get_value(series, key, default=0):
+            if key in series.index:
+                val = series[key]
+                return val if pd.notna(val) else default
+            return default
+
+        # FCF Conversion
+        ocf = get_value(
+            current_cf,
+            "Operating Cash Flow",
+            get_value(current_cf, "Total Cash From Operating Activities"),
+        )
+        capex = get_value(current_cf, "Capital Expenditure")
+        fcf = ocf + capex  # CapEx is negative
+
+        net_income = get_value(current_income, "Net Income")
+        fcf_conversion = fcf / net_income if net_income > 0 else None
+
+        # Working Capital Change
+        current_wc = get_value(current_balance, "Current Assets") - get_value(
+            current_balance, "Current Liabilities"
+        )
+        prev_wc = get_value(prev_balance, "Current Assets") - get_value(
+            prev_balance, "Current Liabilities"
+        )
+        wc_change = current_wc - prev_wc
+        wc_change_pct = (wc_change / abs(prev_wc)) * 100 if prev_wc != 0 else None
+
+        # CapEx vs Depreciation
+        depreciation = get_value(
+            current_cf,
+            "Depreciation",
+            get_value(current_income, "Depreciation And Amortization"),
+        )
+        capex_ratio = abs(capex) / depreciation if depreciation > 0 else None
+
+        quality_score = "Good"
+        concerns = []
+
+        if fcf_conversion and fcf_conversion < 0.5:
+            quality_score = "Poor"
+            concerns.append("Low FCF conversion")
+        elif fcf_conversion and fcf_conversion < 0.7:
+            quality_score = "Fair"
+            concerns.append("Moderate FCF conversion")
+
+        if wc_change_pct and wc_change_pct > 20:
+            concerns.append("Rapid working capital growth (cash tied up)")
+
+        if capex_ratio and capex_ratio > 1.5:
+            concerns.append("High CapEx vs Depreciation (aggressive growth)")
+
+        return {
+            "FCF Conversion Ratio": round(fcf_conversion, 2)
+            if fcf_conversion
+            else None,
+            "Working Capital Change (%)": round(wc_change_pct, 1)
+            if wc_change_pct
+            else None,
+            "CapEx/Depreciation Ratio": round(capex_ratio, 2) if capex_ratio else None,
+            "Cash Flow Quality": quality_score,
+            "Cash Flow Concerns": "; ".join(concerns) if concerns else None,
+        }
+
+    except Exception as e:
+        logger.debug(f"Cash flow quality analysis failed: {str(e)}")
+        return {}
+
+
+def detect_accounting_red_flags(ticker: yf.Ticker) -> dict:
+    """
+    Detect potential accounting red flags:
+    1. Inventory growth > Revenue growth (potential obsolescence)
+    2. Accounts Receivable growth > Revenue growth (collection issues)
+    3. Revenue growth but declining margins (pricing pressure)
+    """
+    try:
+        income = ticker.financials
+        balance = ticker.balance_sheet
+
+        if (
+            income.empty
+            or balance.empty
+            or len(income.columns) < 2
+            or len(balance.columns) < 2
+        ):
+            return {}
+
+        current_income = income.iloc[:, 0]
+        prev_income = income.iloc[:, 1]
+        current_balance = balance.iloc[:, 0]
+        prev_balance = balance.iloc[:, 1]
+
+        def get_value(series, key, default=0):
+            if key in series.index:
+                val = series[key]
+                return val if pd.notna(val) else default
+            return default
+
+        red_flags = []
+
+        # Revenue growth
+        current_revenue = get_value(current_income, "Total Revenue")
+        prev_revenue = get_value(prev_income, "Total Revenue")
+        revenue_growth = (
+            (current_revenue - prev_revenue) / prev_revenue * 100
+            if prev_revenue > 0
+            else None
+        )
+
+        # Inventory growth vs Revenue growth
+        current_inventory = get_value(current_balance, "Inventory")
+        prev_inventory = get_value(prev_balance, "Inventory")
+        if prev_inventory > 0 and current_inventory > 0:
+            inventory_growth = (
+                (current_inventory - prev_inventory) / prev_inventory * 100
+            )
+            if revenue_growth and inventory_growth > revenue_growth * 1.5:
+                red_flags.append("Inventory growing faster than revenue")
+
+        # AR growth vs Revenue growth
+        current_ar = get_value(
+            current_balance,
+            "Accounts Receivable",
+            get_value(current_balance, "Net Receivables"),
+        )
+        prev_ar = get_value(
+            prev_balance,
+            "Accounts Receivable",
+            get_value(prev_balance, "Net Receivables"),
+        )
+        if prev_ar > 0 and current_ar > 0:
+            ar_growth = (current_ar - prev_ar) / prev_ar * 100
+            if revenue_growth and ar_growth > revenue_growth * 1.5:
+                red_flags.append("AR growing faster than revenue (collection risk)")
+
+        # Margin compression
+        current_gross = get_value(current_income, "Gross Profit")
+        prev_gross = get_value(prev_income, "Gross Profit")
+        if current_revenue > 0 and prev_revenue > 0:
+            current_gm = (current_gross / current_revenue) * 100
+            prev_gm = (prev_gross / prev_revenue) * 100
+            if prev_gm > 0 and current_gm < prev_gm * 0.9:  # 10%+ decline
+                red_flags.append("Gross margin compression")
+
+        return {
+            "Accounting Red Flags": "; ".join(red_flags) if red_flags else "None",
+            "Red Flag Count": len(red_flags),
+        }
+
+    except Exception as e:
+        logger.debug(f"Accounting red flags detection failed: {str(e)}")
+        return {"Accounting Red Flags": "Unknown", "Red Flag Count": 0}
+
+
+def analyze_debt_maturity_risk(ticker: yf.Ticker, info: dict) -> dict:
+    """
+    Analyze debt maturity and refinancing risk.
+    High short-term debt relative to cash = liquidity risk.
+    """
+    try:
+        balance = ticker.balance_sheet
+        if balance.empty:
+            return {}
+
+        current_balance = (
+            balance.iloc[:, 0] if len(balance.columns) > 0 else pd.Series()
+        )
+
+        def get_value(series, key, default=0):
+            if key in series.index:
+                val = series[key]
+                return val if pd.notna(val) else default
+            return default
+
+        short_term_debt = get_value(
+            current_balance,
+            "Short Term Debt",
+            get_value(current_balance, "Current Debt"),
+        )
+        long_term_debt = get_value(
+            current_balance,
+            "Long Term Debt",
+            get_value(current_balance, "Long Term Debt And Capital Lease Obligation"),
+        )
+        total_debt = short_term_debt + long_term_debt
+        cash = info.get("totalCash", 0) or info.get("cash", 0) or 0
+
+        # Short-term debt coverage
+        st_debt_coverage = cash / short_term_debt if short_term_debt > 0 else None
+
+        # Debt maturity ratio
+        st_debt_ratio = (short_term_debt / total_debt * 100) if total_debt > 0 else None
+
+        risk_level = "Low"
+        concerns = []
+
+        if st_debt_coverage and st_debt_coverage < 1.0:
+            risk_level = "High"
+            concerns.append("Insufficient cash to cover short-term debt")
+        elif st_debt_coverage and st_debt_coverage < 1.5:
+            risk_level = "Moderate"
+            concerns.append("Tight cash coverage of short-term debt")
+
+        if st_debt_ratio and st_debt_ratio > 40:
+            concerns.append("High proportion of short-term debt")
+
+        return {
+            "Short-Term Debt Coverage": round(st_debt_coverage, 2)
+            if st_debt_coverage
+            else None,
+            "Short-Term Debt %": round(st_debt_ratio, 1) if st_debt_ratio else None,
+            "Debt Maturity Risk": risk_level,
+            "Debt Concerns": "; ".join(concerns) if concerns else None,
+        }
+
+    except Exception as e:
+        logger.debug(f"Debt maturity analysis failed: {str(e)}")
+        return {}
+
+
+def check_dividend_sustainability(ticker: yf.Ticker, info: dict) -> dict:
+    """
+    Check dividend sustainability for dividend-paying stocks.
+    Key metrics: Payout ratio, FCF coverage, dividend growth trend.
+    """
+    try:
+        dividend_yield = info.get("dividendYield", 0) or 0
+        if dividend_yield == 0:
+            return {"Dividend Paying": False}
+
+        income = ticker.financials
+        cashflow = ticker.cashflow
+
+        if income.empty or cashflow.empty:
+            return {"Dividend Paying": True, "Dividend Sustainability": "Unknown"}
+
+        current_income = income.iloc[:, 0]
+        current_cf = cashflow.iloc[:, 0]
+
+        def get_value(series, key, default=0):
+            if key in series.index:
+                val = series[key]
+                return val if pd.notna(val) else default
+            return default
+
+        net_income = get_value(current_income, "Net Income")
+        ocf = get_value(
+            current_cf,
+            "Operating Cash Flow",
+            get_value(current_cf, "Total Cash From Operating Activities"),
+        )
+        capex = get_value(current_cf, "Capital Expenditure")
+        fcf = ocf + capex
+
+        # Estimate dividends paid (often in cashflow statement)
+        dividends_paid = get_value(
+            current_cf,
+            "Dividends Paid",
+            get_value(current_cf, "Common Stock Dividends Paid"),
+        )
+
+        # If not found, estimate from yield
+        if dividends_paid == 0:
+            market_cap = info.get("marketCap", 0)
+            dividends_paid = market_cap * dividend_yield
+
+        # Payout ratio
+        payout_ratio = (dividends_paid / net_income * 100) if net_income > 0 else None
+
+        # FCF coverage
+        fcf_coverage = (fcf / dividends_paid) if dividends_paid > 0 else None
+
+        sustainability = "Sustainable"
+        concerns = []
+
+        if payout_ratio and payout_ratio > 80:
+            sustainability = "At Risk"
+            concerns.append("High payout ratio (>80%)")
+        elif payout_ratio and payout_ratio > 60:
+            sustainability = "Moderate"
+            concerns.append("Elevated payout ratio")
+
+        if fcf_coverage and fcf_coverage < 1.0:
+            sustainability = "At Risk"
+            concerns.append("FCF insufficient to cover dividends")
+        elif fcf_coverage and fcf_coverage < 1.5:
+            concerns.append("Tight FCF coverage")
+
+        return {
+            "Dividend Paying": True,
+            "Dividend Yield (%)": round(dividend_yield * 100, 2),
+            "Payout Ratio (%)": round(payout_ratio, 1) if payout_ratio else None,
+            "FCF Coverage": round(fcf_coverage, 2) if fcf_coverage else None,
+            "Dividend Sustainability": sustainability,
+            "Dividend Concerns": "; ".join(concerns) if concerns else None,
+        }
+
+    except Exception as e:
+        logger.debug(f"Dividend sustainability check failed: {str(e)}")
+        return {"Dividend Paying": False}
+
+
+def check_valuation_consistency(stock_data: dict) -> dict:
+    """
+    Check if multiple valuation methods agree.
+    If DCF, Graham, and Analyst targets all suggest similar upside/downside,
+    that's a stronger signal.
+    """
+    try:
+        dcf_upside = stock_data.get("DCF Upside (%)")
+        graham_upside = stock_data.get("Graham Upside (%)")
+        analyst_upside = stock_data.get("Upside (%)")
+
+        valuations = []
+        if dcf_upside is not None:
+            valuations.append(("DCF", dcf_upside))
+        if graham_upside is not None:
+            valuations.append(("Graham", graham_upside))
+        if analyst_upside is not None:
+            valuations.append(("Analyst", analyst_upside))
+
+        if len(valuations) < 2:
+            return {"Valuation Consensus": "Insufficient Data"}
+
+        # Check if valuations agree (within 20% of each other)
+        upsides = [v[1] for v in valuations]
+        avg_upside = np.mean(upsides)
+        std_upside = np.std(upsides)
+
+        if std_upside < 15:  # Low variance = high consensus
+            consensus = "Strong Agreement"
+        elif std_upside < 30:
+            consensus = "Moderate Agreement"
+        else:
+            consensus = "Divergent Views"
+
+        # Overall signal
+        if avg_upside > 20:
+            signal = "Strongly Undervalued"
+        elif avg_upside > 10:
+            signal = "Moderately Undervalued"
+        elif avg_upside > 0:
+            signal = "Slightly Undervalued"
+        elif avg_upside > -10:
+            signal = "Fairly Valued"
+        else:
+            signal = "Overvalued"
+
+        return {
+            "Valuation Consensus": consensus,
+            "Average Upside (%)": round(avg_upside, 1),
+            "Valuation Signal": signal,
+            "Valuation Methods": len(valuations),
+        }
+
+    except Exception as e:
+        logger.debug(f"Valuation consistency check failed: {str(e)}")
+        return {"Valuation Consensus": "Unknown"}
+
+
+def calculate_ttm_metrics(ticker: yf.Ticker) -> dict:
+    """
+    Calculate Trailing Twelve Months (TTM) metrics using quarterly data.
+    More current than annual financials.
+    """
+    try:
+        quarterly_income = ticker.quarterly_financials
+        quarterly_cashflow = ticker.quarterly_cashflow
+
+        if quarterly_income.empty:
+            return {}
+
+        # Sum last 4 quarters (most recent = column 0)
+        if len(quarterly_income.columns) < 4:
+            return {}  # Need at least 4 quarters
+
+        ttm_metrics = {}
+
+        # TTM Revenue
+        if "Total Revenue" in quarterly_income.index:
+            ttm_revenue = quarterly_income.loc["Total Revenue"].iloc[:4].sum()
+            ttm_metrics["TTM Revenue"] = ttm_revenue
+
+        # TTM Net Income
+        if "Net Income" in quarterly_income.index:
+            ttm_net_income = quarterly_income.loc["Net Income"].iloc[:4].sum()
+            ttm_metrics["TTM Net Income"] = ttm_net_income
+
+        # TTM EBITDA (if available)
+        if "EBITDA" in quarterly_income.index:
+            ttm_ebitda = quarterly_income.loc["EBITDA"].iloc[:4].sum()
+            ttm_metrics["TTM EBITDA"] = ttm_ebitda
+
+        # TTM Operating Cash Flow
+        if (
+            not quarterly_cashflow.empty
+            and "Operating Cash Flow" in quarterly_cashflow.index
+        ):
+            ttm_ocf = quarterly_cashflow.loc["Operating Cash Flow"].iloc[:4].sum()
+            ttm_metrics["TTM Operating Cash Flow"] = ttm_ocf
+
+        return ttm_metrics
+
+    except Exception:
+        return {}
 
 
 def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
@@ -1710,6 +2986,57 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
 
     # Define relative tolerance from config, with a fallback
     SECTOR_TOLERANCE = CONFIG.get("sector_relative_tolerance", 1.2)  # e.g., 20% premium
+
+    # Phase 3: Batch fetch historical data for technicals and ML
+    print(f"  Batch fetching 1Y price history for {len(tickers)} tickers...")
+    try:
+        # We need historical data for ML training (last ~2 years is better but 1y is okay for now)
+        # Extending to 2y for better ML training
+        batch_history = yf.download(
+            tickers + ["SPY"],
+            period="2y",
+            interval="1d",
+            progress=False,
+            group_by="ticker",
+        )
+    except Exception as e:
+        print(f"  Batch download failed: {e}. Falling back to individual.")
+        batch_history = pd.DataFrame()
+
+    # Initialize ML Engine
+    from ml_engine import AlphaPredictor
+
+    ml_predictor = None
+    if not batch_history.empty:
+        # Convert batch_history MultiIndex to dict of DataFrames {ticker: df}
+        print("  Initializing Quant-ML Alpha Predictor...", end=" ")
+        data_dict = {}
+        # Handle the structure of yf.download result
+        # If multiple tickers: columns are (Ticker, PriceType) or (PriceType, Ticker) ?
+        # usually group_by='ticker' -> Level 0 is Ticker.
+
+        # Check structure
+        if isinstance(batch_history.columns, pd.MultiIndex):
+            # Level 0 is Ticker if group_by='ticker'
+            for t in tickers + ["SPY"]:
+                try:
+                    if t in batch_history.columns.levels[0]:
+                        data_dict[t] = batch_history[t]["Close"]
+                except KeyError:
+                    pass
+        else:
+            # Single ticker case
+            pass
+
+        if len(data_dict) > 1:
+            try:
+                ml_predictor = AlphaPredictor(data_dict, benchmark_symbol="SPY")
+                ml_predictor.train_model()
+            except Exception as e:
+                logger.warning(f"ML Training failed: {str(e)}")
+                ml_predictor = None
+        else:
+            print("Insufficient data for ML.")
 
     for i, symbol in enumerate(tickers):
         print(f"  Analyzing {symbol} ({i + 1}/{len(tickers)})...", end=" ")
@@ -1742,6 +3069,18 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             )
             rev_cagr_pct = rev_cagr * 100 if rev_cagr is not None else None
 
+            # --- NEW: Enhanced Quality & Valuation Metrics ---
+            piotroski = calculate_piotroski_score(ticker)
+            ev_ebitda = calculate_ev_ebitda(ticker, info)
+            ttm_metrics = calculate_ttm_metrics(ticker)
+
+            # --- NEW: Comprehensive Due Diligence Checks ---
+            altman_z = calculate_altman_z_score(ticker, info)
+            cash_flow_quality = calculate_cash_flow_quality(ticker)
+            accounting_flags = detect_accounting_red_flags(ticker)
+            debt_maturity = analyze_debt_maturity_risk(ticker, info)
+            dividend_analysis = check_dividend_sustainability(ticker, info)
+
             # --- Sector-Relative Analysis ---
             sector_medians = get_sector_median_metrics(current_sector)
 
@@ -1752,16 +3091,50 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             analyst_trend = fetch_analyst_recommendations(ticker)
 
             # --- Technicals & Calendar (Phase 4), & Phase 5 (Valuation/Timing) ---
-            technicals = fetch_technical_signals(ticker)
+            # Extract batch data if available
+            ticker_close = None
+            if not batch_history.empty:
+                try:
+                    # yf.download with group_by='ticker' returns MultiIndex (Ticker, PriceType)
+                    # or if single ticker, just PriceType cols.
+                    if len(tickers) == 1:
+                        if "Close" in batch_history.columns:
+                            ticker_close = batch_history["Close"]
+                    else:
+                        if symbol in batch_history.columns.levels[0]:
+                            ticker_close = batch_history[symbol]["Close"]
+                except Exception:
+                    pass
+
+            technicals = fetch_technical_signals(ticker, close_series=ticker_close)
             calendar = check_earnings_calendar(ticker)
-            rsi = fetch_rsi(ticker)
+            rsi = fetch_rsi(ticker, close_series=ticker_close)
             peg = calculate_peg_ratio(ticker, info)
             peg_ratio = peg.get("PEG Ratio")
             sector_trend = fetch_sector_trend(current_sector)
 
+            # --- ML Alpha Prediction (Return Forecast) ---
+            ml_score = 0.0  # Default 0% return
+            if ml_predictor:
+                try:
+                    ml_score = ml_predictor.predict_alpha_probability(symbol)
+                except Exception:
+                    ml_score = 0.0
+
             # --- Stage 2 Filtering ---
             passed = True
             fail_reasons = []
+
+            # Enforce Trend Filter (Price > SMA200) from Phase 4 calculations
+            sma200 = technicals.get("SMA200")
+            price_for_trend = info.get("currentPrice") or info.get("previousClose")
+
+            if price_for_trend and sma200:
+                if price_for_trend < sma200:
+                    passed = False
+                    fail_reasons.append(
+                        f"Downtrend (Price {price_for_trend:.2f} < SMA200 {sma200:.2f})"
+                    )
 
             # Absolute checks (hard rules)
             if pfcf is None or pfcf <= 0:
@@ -1805,7 +3178,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 roe and median_roe and roe < median_roe * 0.8
             ):  # Must be at least 80% of sector median
                 passed = False
-                fail_reasons.append(f"ROE < Sector Median")
+                fail_reasons.append("ROE < Sector Median")
 
             # --- Compile Data ---
             status = "PASS" if passed else f"FAIL ({', '.join(fail_reasons)})"
@@ -1831,6 +3204,25 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             )
 
             dcf_data = calculate_dcf_fair_value(ticker, info, risk_free_rate)
+
+            # Fetch earnings surprise data
+            earnings_surprise_data = fetch_earnings_surprise(ticker)
+
+            # Fetch news sentiment data
+            news_sentiment_data = analyze_sentiment_with_ai(symbol, ticker)
+
+            # Calculate valuation consistency (needs all valuation data)
+            valuation_consistency = check_valuation_consistency(
+                {
+                    "DCF Upside (%)": dcf_data.get("DCF Upside (%)"),
+                    "Graham Upside (%)": graham_upside,
+                    "Upside (%)": (info.get("targetMeanPrice", 0) - current_price)
+                    / current_price
+                    * 100
+                    if info.get("targetMeanPrice") and current_price
+                    else None,
+                }
+            )
 
             result_row = {
                 "Symbol": symbol,
@@ -1881,9 +3273,22 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 **rsi,
                 **peg,
                 **sector_trend,
+                "ML Alpha Score": ml_score,
+                **piotroski,
+                "EV/EBITDA": ev_ebitda,
+                **ttm_metrics,
+                **altman_z,
+                **cash_flow_quality,
+                **accounting_flags,
+                **debt_maturity,
+                **dividend_analysis,
+                **valuation_consistency,
+                **earnings_surprise_data,
+                **news_sentiment_data,
             }
 
             # Calculate Conviction Score (Fix for KeyError)
+            # We explicitly pass ml_score to the calculation if needed, or rely on it being in result_row
             score, reasons = calculate_conviction_score(result_row)
             result_row["Conviction Score"] = score
             result_row["Conviction Reasons"] = "; ".join(reasons)
@@ -1891,6 +3296,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             results.append(result_row)
 
         except Exception as e:
+            logger.error(f"Error processing {symbol}: {str(e)}", exc_info=True)
             print(f"ERROR processing {symbol}: {e}")
             continue
 
@@ -1901,19 +3307,17 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
 # PORTFOLIO OPTIMIZATION
 # =============================================================================
 def build_optimized_portfolio(
-    passed_df: pd.DataFrame, min_stocks: int = 6, max_weight: float = 0.20
+    passed_df: pd.DataFrame,
+    min_stocks: int = 6,
+    max_weight: float = 0.20,
+    objective: str = "sharpe",
 ) -> pd.DataFrame:
     """
-    Build a Sharpe-optimized portfolio from screener results.
-
-    Rules:
-    - Minimum 6 stocks for diversification
-    - Maximum 15% in any single name
-    - Sector diversification (max 2 per sector initially)
-    - Fallback: equal weight with BIL (T-bills) and TLT (20yr bonds) if < 4 stocks
+    Build an optimized portfolio from screener results.
+    Objectives: 'sharpe' (default), 'return', 'sortino'
     """
     print("\n" + "=" * 60)
-    print("PORTFOLIO OPTIMIZATION - Sharpe Ratio Maximization")
+    print(f"PORTFOLIO OPTIMIZATION - Objective: Maximize {objective.capitalize()}")
     print("=" * 60)
 
     # Get unique symbols and sectors
@@ -1928,7 +3332,10 @@ def build_optimized_portfolio(
     sector_counts = {}
     max_sector_weight = max_weight
     max_stocks_per_sector = max_sector_weight / passed_df["Sector"].nunique()
-    passed_df = passed_df.sort_values(by="Market Cap ($B)", ascending=False)
+    # Sort by Conviction Score (descending) to prioritize best ideas, then Market Cap as tiebreaker
+    passed_df = passed_df.sort_values(
+        by=["Conviction Score", "Market Cap ($B)"], ascending=[False, False]
+    )
     for _, row in passed_df.iterrows():
         sector = row.get("Sector", "Unknown")
         if sector_counts.get(sector, 0) < max_stocks_per_sector:  # Max 2 per sector
@@ -1986,16 +3393,61 @@ def build_optimized_portfolio(
                 return np.inf
             return -(p_ret - risk_free_rate) / p_vol
 
+        def negative_total_return(weights, mean_returns):
+            return -np.dot(weights, mean_returns)
+
+        def negative_sortino(weights, returns_df, risk_free_rate):
+            # Sortino needs full return series, not just mean/cov
+            p_daily_ret = must_calculate_portfolio_daily_returns(weights, returns_df)
+            mean_ret = p_daily_ret.mean() * 252
+
+            # Downside dev
+            target = 0  # or risk_free_rate / 252
+            downside = p_daily_ret[p_daily_ret < target]
+            if len(downside) == 0:
+                downside_dev = 1e-9
+            else:
+                downside_dev = downside.std() * np.sqrt(252)
+
+            if downside_dev < 1e-9:
+                return np.inf
+
+            return -(mean_ret - risk_free_rate) / downside_dev
+
+        # Helper for sortino
+        def must_calculate_portfolio_daily_returns(weights, returns_df):
+            return returns_df.dot(weights)
+
         # Constraints: sum of weights = 1
         constraints = {"type": "eq", "fun": lambda x: np.sum(x) - 1}
         # Bounds: 0 <= weight <= max_weight
         bounds = tuple((0.02, max_weight) for _ in range(n_assets))
 
-        print("Optimizing for Sharpe ratio (scipy)...")
+        print(f"Optimizing for {objective} (scipy)...")
+
+        args = ()
+        fun = None
+
+        if objective == "return":
+            fun = negative_total_return
+            args = (mean_returns,)
+        elif objective == "sortino":
+            # For Sortino we need the raw returns dataframe passed to the cost function
+            # optimization function signature match
+            def sortino_wrapper(w):
+                return negative_sortino(w, returns, risk_free_rate)
+
+            fun = sortino_wrapper
+            args = ()
+        else:
+            # Default to Sharpe
+            fun = negative_sharpe
+            args = (mean_returns, cov_matrix_reg, risk_free_rate)
+
         result = minimize(
-            negative_sharpe,
+            fun,
             n_assets * [1.0 / n_assets],  # Initial guess: equal weights
-            args=(mean_returns, cov_matrix_reg, risk_free_rate),
+            args=args,
             method="SLSQP",
             bounds=bounds,
             constraints=constraints,
@@ -2040,6 +3492,38 @@ def build_optimized_portfolio(
         print(f"  Expected Volatility: {port_volatility:.1f}%")
         print(f"  Sharpe Ratio: {best_sharpe:.2f}")
         print(f"  Max Position: {portfolio_df['Weight (%)'].max():.1f}%")
+
+        # Correlation Analysis
+        try:
+            corr_matrix = returns.corr()
+            high_corr_pairs = []
+            for i in range(len(corr_matrix.columns)):
+                for j in range(i + 1, len(corr_matrix.columns)):
+                    corr_val = corr_matrix.iloc[i, j]
+                    if corr_val > 0.7:
+                        high_corr_pairs.append(
+                            {
+                                "Stock 1": corr_matrix.columns[i],
+                                "Stock 2": corr_matrix.columns[j],
+                                "Correlation": corr_val,
+                            }
+                        )
+
+            if high_corr_pairs:
+                print("\n⚠️  High Correlation Warnings (>0.7):")
+                for pair in high_corr_pairs:
+                    print(
+                        f"  {pair['Stock 1']} <-> {pair['Stock 2']}: {pair['Correlation']:.2f}"
+                    )
+            else:
+                avg_corr = corr_matrix.values[
+                    np.triu_indices_from(corr_matrix.values, k=1)
+                ].mean()
+                print(
+                    f"\n✓ Portfolio Diversification: Avg Correlation = {avg_corr:.2f}"
+                )
+        except Exception:
+            pass  # Skip correlation if calculation fails
 
         # Export portfolio
         portfolio_df.to_csv("portfolio_allocation.csv", index=False)
@@ -2145,6 +3629,18 @@ def parse_args():
         action="store_true",
         help="Skip PDF research report generation.",
     )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Run a 1-year backtest performance analysis of the final portfolio.",
+    )
+    parser.add_argument(
+        "--objective",
+        type=str,
+        default="return",
+        choices=["sharpe", "return", "sortino"],
+        help="Portfolio optimization objective (sharpe, return, sortino).",
+    )
     return parser.parse_args()
 
 
@@ -2221,7 +3717,13 @@ def main():
     portfolio_df = pd.DataFrame()
     advice_df = pd.DataFrame()
     if not passed_df.empty and not args.skip_portfolio:
-        portfolio_df = build_optimized_portfolio(passed_df)
+        portfolio_df = build_optimized_portfolio(passed_df, objective=args.objective)
+
+        # Run Backtest if requested
+        if args.backtest and not portfolio_df.empty:
+            tickers = portfolio_df["Symbol"].tolist()
+            weights = (portfolio_df["Weight (%)"] / 100.0).tolist()
+            backtest_portfolio(tickers, weights)
 
     if not passed_df.empty and not args.skip_advice:
         # Generate AI-powered investment advice

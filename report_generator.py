@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import numpy as np
+import pandas as pd
 from fpdf import FPDF
 
 
@@ -170,10 +172,13 @@ class ResearchReport(FPDF):
         # Helper to safely format floats
         def safe_fmt(val, fmt="{:.2f}"):
             try:
-                if val is None or val == "N/A":
+                if val is None or val == "N/A" or pd.isna(val):
                     return "N/A"
-                return fmt.format(float(val))
-            except:
+                val_float = float(val)
+                if not pd.isna(val_float) and np.isfinite(val_float):
+                    return fmt.format(val_float)
+                return "N/A"
+            except (ValueError, TypeError):
                 return "N/A"
 
         metrics = [
@@ -182,7 +187,7 @@ class ResearchReport(FPDF):
                 f"${safe_fmt(stock_data.get('Market Cap ($B)'), '{:.1f}')}B",
             ),
             ("P/E Ratio", safe_fmt(stock_data.get("P/E"))),
-            ("PEG Ratio", safe_fmt(stock_data.get("PEG"))),
+            ("PEG Ratio", safe_fmt(stock_data.get("PEG Ratio"))),
             ("P/FCF", safe_fmt(stock_data.get("P/FCF"))),
             ("ROIC", f"{safe_fmt(stock_data.get('ROIC (%)'))}%"),
             ("ROE", f"{safe_fmt(stock_data.get('ROE (%)'))}%"),
@@ -246,11 +251,27 @@ class ResearchReport(FPDF):
         self.cell(0, 8, "Sentiment & Momentum", 0, 1)
         self.set_font("Helvetica", "", 10)
 
-        sentiment_score = stock_data.get("News Sentiment Score", "N/A")
-        earnings_surprise = stock_data.get("Earnings Surprise Avg (%)", "N/A")
+        # News Sentiment Score
+        sentiment_score = stock_data.get("News Sentiment Score")
+        sentiment_label = stock_data.get("News Sentiment Label", "")
+        if sentiment_score is not None and not pd.isna(sentiment_score):
+            sentiment_display = f"{sentiment_score:.2f}"
+            if sentiment_label:
+                sentiment_display += f" ({sentiment_label})"
+        else:
+            sentiment_display = "N/A"
+        self.cell(0, 6, f"News Sentiment Score: {sentiment_display}", 0, 1)
 
-        self.cell(0, 6, f"News Sentiment Score: {sentiment_score}", 0, 1)
-        self.cell(0, 6, f"Avg Earnings Surprise (4Q): {earnings_surprise}%", 0, 1)
+        # Earnings Surprise
+        earnings_surprise = stock_data.get("Earnings Surprise Avg (%)")
+        last_surprise = stock_data.get("Last Quarter Surprise (%)")
+        if earnings_surprise is not None and not pd.isna(earnings_surprise):
+            surprise_display = f"{earnings_surprise:.2f}%"
+            if last_surprise is not None and not pd.isna(last_surprise):
+                surprise_display += f" (Last Q: {last_surprise:.2f}%)"
+        else:
+            surprise_display = "N/A"
+        self.cell(0, 6, f"Avg Earnings Surprise (4Q): {surprise_display}", 0, 1)
 
 
 def generate_pdf_report(advice_df, portfolio_df, risk_free_rate=0.045):
