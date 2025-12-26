@@ -3126,11 +3126,11 @@ def build_stage1_query() -> EquityQuery:
             "btwn", ["lastclosemarketcap.lasttwelvemonths", MCAP_MIN, MCAP_MAX]
         ),
         # Positive EPS (per RULES.md line 8)
-        EquityQuery("gte", ["basicepscontinuingoperations.lasttwelvemonths", 0.001]),
+        # EquityQuery("gte", ["basicepscontinuingoperations.lasttwelvemonths", 0.001]),
         # EPS Growth >= 6% (per RULES.md line 32)
         EquityQuery("gte", ["epsgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
         # P/E < 50 (per RULES.md line 13)
-        EquityQuery("btwn", ["peratio.lasttwelvemonths", 0, PE_MAX]),
+        EquityQuery("btwn", ["peratio.lasttwelvemonths", 10, PE_MAX]),
         # PEG < 1.1 (per RULES.md line 16-22, strict requirement)
         EquityQuery("lte", ["pegratio_5y", PEG_MAX]),
         # D/E < 0.5 (per RULES.md line 9-11)

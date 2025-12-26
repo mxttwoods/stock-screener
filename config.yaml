@@ -1,13 +1,13 @@
 market_cap:
-  min: 1000000000 # $1B (per RULES.md line 7)
-  max: 500000000000 # $500B (per RULES.md line 7)
+  min: 20000000000 # $20B (per RULES.md line 7)
+  max: 4000000000000 # $4T (per RULES.md line 7)
 beta:
   min: 0.50
   max: 2.5
 valuation:
   pe_max: 50.0 # Per RULES.md line 13
-  peg_max: 2 # Per RULES.md line 16-22 (strict requirement)
-  pfcf_max: 50.0 # Per RULES.md line 26-28 (20-25 range, using 25 as max)
+  peg_max: 3 # Per RULES.md line 16-22 (strict requirement)
+  pfcf_max: 75.0 # Per RULES.md line 26-28 (20-25 range, using 25 as max)
   margin_of_safety: 0.25 # Graham margin of safety for buy-below price
   dcf_scenarios: true # Enable bull/bear/base DCF scenario analysis
 profitability:
@@ -18,13 +18,13 @@ profitability:
   operating_margin_min_pct: 15.0
 growth:
   fiftytwowk_percentchange_min_pct: -70.0
-  fiftytwowk_percentchange_max_pct: 30.0
+  fiftytwowk_percentchange_max_pct: 50.0
   revenue_growth_min_pct: 6.0 # Per RULES.md line 31
   earnings_growth_min_pct: 6.0 # Per RULES.md line 32
   ebitda_growth_min_pct: 6.0 # Per RULES.md line 33
   cagr_min_pct: 6.0 # Per RULES.md line 34-36
 balance_sheet:
-  debt_to_equity_max: 1 # Per RULES.md line 9-11 (D/E < 0.5)
+  debt_to_equity_max: 3 # Per RULES.md line 9-11 (D/E < 0.5)
   current_ratio_max: 5.0
   interest_coverage_min: 3.0 # Per RULES.md line 50-54 (EBIT/Interest > 3)
 analyst:
@@ -32,7 +32,7 @@ analyst:
     - buy
     - strong_buy
     - outperform
-    - hold
+    # - hold
 excluded_symbols:
   - GME
   - AMC
