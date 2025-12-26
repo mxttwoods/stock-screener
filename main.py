@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
-from openai import OpenAI
 from yfinance import EquityQuery
 from scipy.optimize import minimize
 import yaml
@@ -37,10 +36,6 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
-
-# OpenAI API configuration (optional)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 # =============================================================================
@@ -456,22 +451,29 @@ def fetch_earnings_surprise(ticker: yf.Ticker) -> dict:
                     avg = last_4q.mean()
                     last_surprise = surprises.iloc[0] if len(surprises) > 0 else 0
 
-                    # Formatting: yfinance typically returns as decimal (0.05 = 5%)
-                    # But sometimes it's already a percentage. Check if we need to multiply.
-                    if abs(avg) < 1.0:
+                    # Determine if values are decimals or percentages
+                    # yfinance earnings_history typically returns percentages directly
+                    # (e.g., 5.2 means 5.2%, not 0.052)
+                    # We use the column name as a hint and check value ranges
+                    is_percentage = "%" in surprise_col or surprise_col == "Surprise"
+
+                    # If not explicitly percentage and values look like decimals
+                    # (all absolute values < 2), assume decimals and convert
+                    max_abs = max(abs(last_4q.max()), abs(last_4q.min()))
+                    if not is_percentage and max_abs < 2.0:
                         avg_pct = avg * 100
-                        last_pct = (
-                            last_surprise * 100
-                            if abs(last_surprise) < 1.0
-                            else last_surprise
-                        )
+                        last_pct = last_surprise * 100
                     else:
                         avg_pct = avg
                         last_pct = last_surprise
 
+                    # Sanity check: earnings surprises rarely exceed ±100%
+                    if abs(avg_pct) > 500:
+                        logger.debug(f"Unusual earnings surprise value: {avg_pct}")
+
                     return {
-                        "Earnings Surprise Avg (%)": round(avg_pct, 2),
-                        "Last Quarter Surprise (%)": round(last_pct, 2),
+                        "Earnings Surprise Avg (%)": round(float(avg_pct), 2),
+                        "Last Quarter Surprise (%)": round(float(last_pct), 2),
                     }
 
         # Method 2: Try quarterly_earnings and calculate manually
@@ -778,9 +780,22 @@ def fetch_rsi(ticker, period=14, close_series=None) -> dict:
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
 
-        # Calculate RS
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs)).iloc[-1]  # Most recent RSI
+        # Calculate RS with safety checks
+        # When loss is 0, RS is infinite (100% gains) -> RSI = 100
+        # When gain is 0, RS is 0 -> RSI = 0
+        last_gain = gain.iloc[-1] if len(gain) > 0 else 0
+        last_loss = loss.iloc[-1] if len(loss) > 0 else 0
+
+        if pd.isna(last_gain) or pd.isna(last_loss):
+            return {"RSI": None, "RSI Signal": "Insufficient Data"}
+
+        if last_loss == 0:
+            rsi = 100.0 if last_gain > 0 else 50.0  # All gains or no movement
+        elif last_gain == 0:
+            rsi = 0.0  # All losses
+        else:
+            rs = last_gain / last_loss
+            rsi = 100 - (100 / (1 + rs))
 
         signal = "Neutral"
         if rsi < 30:
@@ -788,7 +803,7 @@ def fetch_rsi(ticker, period=14, close_series=None) -> dict:
         elif rsi > 70:
             signal = "Overbought (Risk)"
 
-        return {"RSI": round(rsi, 2), "RSI Signal": signal}
+        return {"RSI": round(float(rsi), 2), "RSI Signal": signal}
     except Exception:
         return {"RSI": None, "RSI Signal": "Error"}
 
@@ -984,49 +999,25 @@ def check_earnings_calendar(ticker) -> dict:
         return {"Upcoming Earnings": False, "Days to Earnings": None}
 
 
-def analyze_sentiment_with_ai(symbol: str, ticker: yf.Ticker) -> dict:
+def get_news_data(symbol: str, ticker: yf.Ticker) -> dict:
     """
-    Analyze news sentiment using OpenAI on yfinance news titles.
+    Get news data from yfinance (sentiment analysis removed).
+    Returns basic news availability info.
     """
-    if not openai_client:
-        return {"News Sentiment Score": None, "News Sentiment Label": None}
-
     try:
         news = ticker.news
-        if not news:
-            return {"News Sentiment Score": None, "News Sentiment Label": None}
-
-        headlines = [n.get("title", "") for n in news[:15]]
-        headlines_text = "\n".join(f"- {h}" for h in headlines)
-
-        prompt = f"""Analyze the sentiment of the following news headlines for {symbol}.
-Headlines:
-{headlines_text}
-
-Return a valid JSON object with exactly two keys:
-"score": A float between -1.0 (Very Bearish) and 1.0 (Very Bullish).
-"label": A string text label (e.g., "Bullish", "Bearish", "Neutral").
-"""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=100,
-            temperature=0.0,
-        )
-
-        result_text = response.choices[0].message.content.strip()
-        result_json = json.loads(result_text)
-
+        news_count = len(news) if news else 0
         return {
-            "News Sentiment Score": result_json.get("score"),
-            "News Sentiment Label": result_json.get("label"),
+            "News Sentiment Score": None,
+            "News Sentiment Label": None,
+            "Recent News Count": news_count,
         }
-
     except Exception:
-        # print(f"AI Sentiment Error: {e}")
-        return {"News Sentiment Score": 0, "News Sentiment Label": "Error"}
+        return {
+            "News Sentiment Score": None,
+            "News Sentiment Label": None,
+            "Recent News Count": 0,
+        }
 
 
 # =============================================================================
@@ -1353,105 +1344,53 @@ def classify_action(conviction: int, graham_undervalued: bool, upside: float) ->
         return "⚪ HOLD"
 
 
-def generate_ai_thesis(
-    stock_data: dict, ticker_info: dict, conviction_score: int, risks: list
+def generate_investment_summary(
+    stock_data: dict, ticker_info: dict, conviction_score: int, reasons: list
 ) -> str:
     """
-    Generate an AI-powered investment thesis using OpenAI.
+    Generate a structured investment summary based on metrics (no AI).
+    Returns a formatted string with key signals and action.
     """
-    if not openai_client:
-        return "AI thesis unavailable (disabled or no API key)"
+    symbol = stock_data.get("Symbol", "Unknown")
 
-    try:
-        # Build context for the AI
-        symbol = stock_data.get("Symbol", "Unknown")
-        name = stock_data.get("Name", "Unknown")
-        sector = stock_data.get("Sector", "Unknown")
+    # Collect bullish and warning signals
+    bullish = [r for r in reasons if "✓" in r]
+    warnings = [r for r in reasons if "⚠️" in r]
 
-        # Format sector medians for the prompt
-        sector_pe = stock_data.get("Sector Median P/E")
-        sector_roe = stock_data.get("Sector Median ROE")
-        pe_comparison = f"(Sector Median: {sector_pe:.1f})" if sector_pe else ""
-        roe_comparison = (
-            f"(Sector Median: {sector_roe * 100:.1f}%)" if sector_roe else ""
-        )
+    # Build summary
+    summary_parts = []
 
-        prompt = f"""You are a Lead Equity Analyst. Synthesize the following data into a compelling 2-3 sentence investment thesis for {symbol} ({name}).
+    # Action based on conviction
+    if conviction_score >= 70:
+        action = "STRONG BUY"
+    elif conviction_score >= 55:
+        action = "BUY"
+    elif conviction_score >= 40:
+        action = "HOLD"
+    else:
+        action = "WATCH"
 
-Company Profile:
-- Sector: {sector}
-- Market Cap: ${stock_data.get("Market Cap ($B)", "N/A"):.2f}B
-- Analyst Coverage: {stock_data.get("# Analysts", "N/A")} analysts
+    summary_parts.append(f"[{action}] Conviction: {conviction_score}/100")
 
-Financials & Profitability:
-- P/E: {stock_data.get("P/E", "N/A")} {pe_comparison}
-- PEG: {stock_data.get("PEG Ratio", "N/A")}
-- ROE: {stock_data.get("ROE (%)", "N/A")}% {roe_comparison}
-- ROIC: {stock_data.get("ROIC (%)", "N/A")}%
-- Margins: Gross {stock_data.get("Gross Margin (%)", "N/A")}%, Op {stock_data.get("Op Margin (%)", "N/A")}%
+    # Key valuation info
+    dcf_upside = stock_data.get("DCF Upside (%)")
+    graham_undervalued = stock_data.get("Graham Undervalued")
+    if dcf_upside is not None:
+        summary_parts.append(f"DCF Upside: {dcf_upside:.1f}%")
+    if graham_undervalued:
+        summary_parts.append("Graham Undervalued")
 
-Growth:
-- 3Y Revenue CAGR: {stock_data.get("3Y Rev CAGR (%)", "N/A")}%
-- Next Yr Growth Est: {stock_data.get("Next Year Growth Est (%)", "N/A")}%
-- Quarterly Revenue Growth (YoY): {stock_data.get("Quarterly Revenue Growth (%)", "N/A")}%
-- Quarterly Earnings Growth (YoY): {stock_data.get("Quarterly Earnings Growth (%)", "N/A")}%
+    # Top bullish signals (max 3)
+    if bullish:
+        top_bullish = bullish[:3]
+        summary_parts.append(f"Bullish: {', '.join(s.replace(' ✓', '') for s in top_bullish)}")
 
-Valuation Models:
-- Graham Number: ${stock_data.get("Graham Number", "N/A")} (Undervalued: {stock_data.get("Graham Undervalued", "N/A")})
-- PEG Ratio: {stock_data.get("PEG Ratio", "N/A")} (Growth Adj. Val)
-- DCF Fair Value: ${stock_data.get("DCF Fair Value", "N/A")} (Upside: {stock_data.get("DCF Upside (%)", "N/A")}%)
-- Analyst Target: ${stock_data.get("Target Price", "N/A")} (Upside: {stock_data.get("Upside (%)", "N/A")}%)
+    # Top warnings (max 2)
+    if warnings:
+        top_warnings = warnings[:2]
+        summary_parts.append(f"Risks: {', '.join(s.replace(' ⚠️', '') for s in top_warnings)}")
 
-Sentiment & Momentum:
-- Price vs 52W Range: Current ${stock_data.get("Current Price", "N/A")} (Range: ${stock_data.get("52W Low", "N/A")} - ${stock_data.get("52W High", "N/A")})
-- News Sentiment: {stock_data.get("News Sentiment Label", "N/A")} (Score: {stock_data.get("News Sentiment Score", "N/A")})
-- EPS Revisions (30d): {stock_data.get("EPS Up/Down Ratio", "N/A")}x (Up: {stock_data.get("EPS Revisions Up (30d)", 0)} / Down: {stock_data.get("EPS Revisions Down (30d)", 0)})
-- Analyst Trend (3mo): {stock_data.get("Analyst Trend", "N/A")} ({stock_data.get("Current Buy Ratings", 0)} Buys)
-- Earnings Surprise (Avg): {stock_data.get("Earnings Surprise Avg (%)", "N/A")}%
-- Analyst Rating: {stock_data.get("Analyst Rating", "N/A")}
-- Technical Trend: {stock_data.get("Price Trend", "N/A")} (Signal: {stock_data.get("Technical Signal", "N/A")})
-- RSI (14d): {stock_data.get("RSI", "N/A")} (Signal: {stock_data.get("RSI Signal", "N/A")})
-
-Risk Profile:
-- Conviction Score: {conviction_score}/10
-- Identified Risks: {", ".join(risks) if risks else "None"}
-- Debt/Equity: {stock_data.get("D/E", "N/A")}
-- Upcoming Earnings: {"Yes, in " + str(stock_data.get("Days to Earnings")) + " days" if stock_data.get("Upcoming Earnings") else "No"}
-- Sector Trend: {stock_data.get("Sector Trend", "N/A")} (SMA200 Gap: {stock_data.get("Sector SMA200 Gap (%)", "N/A")}%)
-
-Due Diligence:
-- Financial Distress Risk: {stock_data.get("Financial Distress Risk", "N/A")} (Altman Z: {stock_data.get("Altman Z-Score", "N/A")})
-- Cash Flow Quality: {stock_data.get("Cash Flow Quality", "N/A")} (FCF Conversion: {stock_data.get("FCF Conversion Ratio", "N/A")})
-- Accounting Red Flags: {stock_data.get("Red Flag Count", 0)} flags - {stock_data.get("Accounting Red Flags", "None")}
-- Debt Maturity Risk: {stock_data.get("Debt Maturity Risk", "N/A")} (ST Debt Coverage: {stock_data.get("Short-Term Debt Coverage", "N/A")})
-- Dividend Sustainability: {stock_data.get("Dividend Sustainability", "N/A") if stock_data.get("Dividend Paying") else "N/A (Non-dividend)"}
-- Valuation Consensus: {stock_data.get("Valuation Consensus", "N/A")} ({stock_data.get("Valuation Signal", "N/A")}, Avg Upside: {stock_data.get("Average Upside (%)", "N/A")}%)
-
-Task:
-1. Synthesize the signals (e.g., "Trading at a discount to its sector P/E median").
-2. Highlight the primary driver for a BUY or WATCH decision.
-3. Mention the most critical risk.
-4. Be concise (max 80 words). Use numbers. Be formal, direct, and do not provide financial advice."""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-            temperature=0.7,
-        )
-
-        thesis_text = response.choices[0].message.content.strip()
-        # Sanitize text for PDF generation
-        thesis_text = (
-            thesis_text.replace("’", "'")
-            .replace("“", '"')
-            .replace("”", '"')
-            .replace("—", "--")
-        )
-        return thesis_text
-
-    except Exception as e:
-        return f"AI thesis error: {str(e)[:50]}"
+    return " | ".join(summary_parts)
 
 
 def backtest_portfolio(tickers, weights) -> None:
@@ -1645,12 +1584,12 @@ def backtest_portfolio(tickers, weights) -> None:
         print(f"  Error during backtest: {e}")
 
 
-def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
+def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate comprehensive investment advice for all passing stocks.
+    Generate structured investment summaries for all passing stocks.
     """
     print("\n" + "=" * 60)
-    print("INVESTMENT ADVICE - AI-Powered Analysis")
+    print("INVESTMENT SUMMARY - Metrics-Based Analysis")
     print("=" * 60)
 
     if passed_df.empty:
@@ -1720,8 +1659,8 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
             stock_data.get("Upside (%)", 0) or 0,
         )
 
-        # Generate AI thesis
-        thesis = generate_ai_thesis(stock_data, ticker_info, conviction, risks)
+        # Generate investment summary
+        summary = generate_investment_summary(stock_data, ticker_info, conviction, conviction_reasons)
 
         # Create advice row preserving all original data
         advice_row = stock_data.copy()
@@ -1735,13 +1674,13 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
                 )
                 if risks
                 else "None",
-                "AI Thesis": thesis,
+                "Investment Summary": summary,
             }
         )
 
         advice_data.append(advice_row)
 
-        print(f"{action} (Conviction: {conviction}/10)")
+        print(f"{action} (Conviction: {conviction}/100)")
 
     advice_df = pd.DataFrame(advice_data)
 
@@ -1752,14 +1691,14 @@ def generate_investment_advice(passed_df: pd.DataFrame) -> pd.DataFrame:
 
     for _, row in advice_df.iterrows():
         print(f"\n{row['Symbol']} - {row['Name']}")
-        print(f"  Action: {row['Action']} | Conviction: {row['Conviction']}/10")
-        print(f"  Thesis: {row['AI Thesis'][:200]}...")
+        print(f"  Action: {row['Action']} | Conviction: {row['Conviction']}/100")
+        print(f"  Summary: {row['Investment Summary']}")
         if row["Risk Warnings"] != "None":
             print(f"  Risks: {row['Risk Warnings']}")
 
-    # Export advice
-    advice_df.to_csv("investment_advice.csv", index=False)
-    print("\n\nInvestment advice exported to: investment_advice.csv")
+    # Export summary
+    advice_df.to_csv("investment_summary.csv", index=False)
+    print("\n\nInvestment summary exported to: investment_summary.csv")
 
     return advice_df
 
@@ -1923,6 +1862,13 @@ def calculate_dcf_fair_value(
         )
 
         terminal_fcf = projected_fcf[-1] * (1 + terminal_growth)
+        # Guard against division by zero when WACC ≈ terminal_growth
+        if wacc <= terminal_growth + 0.01:
+            return {
+                "DCF Fair Value": None,
+                "DCF Upside (%)": None,
+                "DCF Notes": "WACC too close to terminal growth rate",
+            }
         terminal_value = terminal_fcf / (wacc - terminal_growth)
         pv_terminal = terminal_value / ((1 + wacc) ** projection_years)
 
@@ -1945,10 +1891,55 @@ def calculate_dcf_fair_value(
             else None
         )
 
+        # --- Scenario Analysis ---
+        # Helper function to calculate DCF value for a given growth/WACC
+        def calc_dcf_value(base_fcf, growth_rate, discount_rate, term_growth, years, decay):
+            proj_fcf = []
+            fcf_temp = base_fcf
+            gr = growth_rate
+            for _ in range(years):
+                fcf_temp *= 1 + gr
+                gr *= decay
+                proj_fcf.append(fcf_temp)
+
+            pv = sum(f / ((1 + discount_rate) ** (i + 1)) for i, f in enumerate(proj_fcf))
+
+            if discount_rate <= term_growth + 0.01:
+                return None
+            term_fcf = proj_fcf[-1] * (1 + term_growth)
+            term_val = term_fcf / (discount_rate - term_growth)
+            pv_term = term_val / ((1 + discount_rate) ** years)
+
+            ev = pv + pv_term
+            eq_val = ev - net_debt
+            return eq_val / shares_outstanding if shares_outstanding else None
+
+        # Base case (current calculation)
+        base_value = dcf_fair_value
+
+        # Bull case: Growth +2%, WACC -1%
+        bull_growth = min(0.20, fcf_growth + 0.02)  # Recalculate from original
+        bull_wacc = max(0.06, wacc - 0.01)
+        bull_value = calc_dcf_value(current_fcf, bull_growth, bull_wacc, terminal_growth, projection_years, growth_decay)
+
+        # Bear case: Growth -2%, WACC +1%
+        bear_growth = max(0.01, fcf_growth - 0.02)
+        bear_wacc = min(0.15, wacc + 0.01)
+        bear_value = calc_dcf_value(current_fcf, bear_growth, bear_wacc, terminal_growth, projection_years, growth_decay)
+
+        # Calculate upsides for each scenario
+        bull_upside = ((bull_value - current_price) / current_price * 100) if bull_value and current_price else None
+        bear_upside = ((bear_value - current_price) / current_price * 100) if bear_value and current_price else None
+
         return {
             "DCF Fair Value": round(dcf_fair_value, 2),
             "DCF Upside (%)": round(dcf_upside, 1) if dcf_upside is not None else None,
-            "DCF Notes": f"WACC={wacc * 100:.1f}%, FCF Growth={fcf_growth * 100:.1f}%",
+            "DCF Bull Value": round(bull_value, 2) if bull_value else None,
+            "DCF Bear Value": round(bear_value, 2) if bear_value else None,
+            "DCF Bull Upside (%)": round(bull_upside, 1) if bull_upside is not None else None,
+            "DCF Bear Upside (%)": round(bear_upside, 1) if bear_upside is not None else None,
+            "DCF Range": f"${bear_value:.0f} - ${bull_value:.0f}" if bear_value and bull_value else None,
+            "DCF Notes": f"WACC={wacc * 100:.1f}%, Growth={fcf_growth * 100:.1f}%",
         }
 
     except KeyError as e:
@@ -1956,6 +1947,9 @@ def calculate_dcf_fair_value(
         return {
             "DCF Fair Value": None,
             "DCF Upside (%)": None,
+            "DCF Bull Value": None,
+            "DCF Bear Value": None,
+            "DCF Range": None,
             "DCF Notes": f"Missing data key: {str(e)[:30]}",
         }
     except Exception as e:
@@ -1963,7 +1957,201 @@ def calculate_dcf_fair_value(
         return {
             "DCF Fair Value": None,
             "DCF Upside (%)": None,
+            "DCF Bull Value": None,
+            "DCF Bear Value": None,
+            "DCF Range": None,
             "DCF Notes": f"Error: {str(e)[:30]}",
+        }
+
+
+def calculate_fcf_yield(ticker: yf.Ticker, info: dict, risk_free_rate: float = 0.045) -> dict:
+    """
+    Calculate Free Cash Flow Yield = FCF / Market Cap.
+    This is the inverse of P/FCF and represents the yield an investor
+    would receive if all FCF were distributed.
+    """
+    try:
+        cf = ticker.cash_flow
+        if cf.empty:
+            return {"FCF Yield (%)": None, "Yield Spread": None, "Yield Signal": None}
+
+        # Get operating cash flow
+        operating_cf = None
+        for key in ["Total Cash From Operating Activities", "Operating Cash Flow", "Cash From Operating Activities"]:
+            if key in cf.index:
+                operating_cf = cf.loc[key].iloc[0]
+                break
+
+        # Get CapEx
+        capex = None
+        for key in ["Capital Expenditure", "Capital Expenditures", "Capital Spending"]:
+            if key in cf.index:
+                capex = cf.loc[key].iloc[0]
+                break
+
+        if operating_cf is None or capex is None:
+            return {"FCF Yield (%)": None, "Yield Spread": None, "Yield Signal": None}
+
+        fcf = operating_cf + capex  # capex is negative
+        market_cap = info.get("marketCap")
+
+        if not market_cap or market_cap <= 0:
+            return {"FCF Yield (%)": None, "Yield Spread": None, "Yield Signal": None}
+
+        fcf_yield = (fcf / market_cap) * 100
+
+        # Compare to risk-free rate (10Y Treasury) as "equity bond yield"
+        risk_free_pct = risk_free_rate * 100
+        yield_spread = fcf_yield - risk_free_pct
+
+        # Signal based on yield spread
+        if yield_spread > 3:
+            signal = "Very Attractive"
+        elif yield_spread > 1:
+            signal = "Attractive"
+        elif yield_spread > -1:
+            signal = "Fair"
+        else:
+            signal = "Unattractive"
+
+        return {
+            "FCF Yield (%)": round(fcf_yield, 2),
+            "Yield Spread": round(yield_spread, 2),
+            "Yield Signal": signal,
+        }
+
+    except Exception as e:
+        logger.debug(f"FCF Yield calculation failed: {str(e)}")
+        return {"FCF Yield (%)": None, "Yield Spread": None, "Yield Signal": None}
+
+
+def calculate_growth_quality(ticker: yf.Ticker) -> dict:
+    """
+    Assess if growth is sustainable and profitable.
+    Returns a Growth Quality Score (0-3) based on:
+    1. Margin trend (stable/expanding vs compressing)
+    2. Operating leverage (earnings growing faster than revenue)
+    3. FCF conversion (FCF growth backing earnings growth)
+    """
+    try:
+        income = ticker.financials
+        cf = ticker.cash_flow
+
+        if income.empty or len(income.columns) < 3:
+            return {
+                "Growth Quality Score": None,
+                "Margin Trend": None,
+                "Operating Leverage": None,
+                "FCF Backs Growth": None,
+            }
+
+        quality_score = 0
+        details = {}
+
+        # 1. Margin Trend Analysis
+        try:
+            revenues = []
+            op_income = []
+            for i in range(min(3, len(income.columns))):
+                for rev_key in ["Total Revenue", "Revenue", "Net Sales"]:
+                    if rev_key in income.index:
+                        revenues.append(income.loc[rev_key].iloc[i])
+                        break
+                for op_key in ["Operating Income", "EBIT"]:
+                    if op_key in income.index:
+                        op_income.append(income.loc[op_key].iloc[i])
+                        break
+
+            if len(revenues) >= 2 and len(op_income) >= 2:
+                current_margin = op_income[0] / revenues[0] if revenues[0] else 0
+                old_margin = op_income[-1] / revenues[-1] if revenues[-1] else 0
+
+                if old_margin > 0:
+                    margin_change = (current_margin - old_margin) / abs(old_margin)
+                    if margin_change > 0.05:
+                        details["Margin Trend"] = "Expanding"
+                        quality_score += 1
+                    elif margin_change > -0.05:
+                        details["Margin Trend"] = "Stable"
+                        quality_score += 1
+                    else:
+                        details["Margin Trend"] = "Compressing"
+                else:
+                    details["Margin Trend"] = "Unknown"
+            else:
+                details["Margin Trend"] = "Insufficient Data"
+        except Exception:
+            details["Margin Trend"] = "Error"
+
+        # 2. Operating Leverage (Earnings growth vs Revenue growth)
+        try:
+            if len(revenues) >= 2 and revenues[-1] > 0:
+                rev_growth = (revenues[0] - revenues[-1]) / abs(revenues[-1])
+            else:
+                rev_growth = None
+
+            if len(op_income) >= 2 and op_income[-1] and op_income[-1] > 0:
+                earnings_growth = (op_income[0] - op_income[-1]) / abs(op_income[-1])
+            else:
+                earnings_growth = None
+
+            if rev_growth and rev_growth > 0 and earnings_growth:
+                op_leverage = earnings_growth / rev_growth
+                details["Operating Leverage"] = round(op_leverage, 2)
+                if op_leverage > 1.0:
+                    quality_score += 1
+            else:
+                details["Operating Leverage"] = None
+        except Exception:
+            details["Operating Leverage"] = None
+
+        # 3. FCF Conversion (FCF growth relative to earnings growth)
+        try:
+            if not cf.empty and len(cf.columns) >= 2:
+                fcf_current = None
+                fcf_old = None
+
+                for ocf_key in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
+                    if ocf_key in cf.index:
+                        for capex_key in ["Capital Expenditure", "Capital Expenditures"]:
+                            if capex_key in cf.index:
+                                fcf_current = cf.loc[ocf_key].iloc[0] + cf.loc[capex_key].iloc[0]
+                                fcf_old = cf.loc[ocf_key].iloc[-1] + cf.loc[capex_key].iloc[-1]
+                                break
+                        break
+
+                if fcf_current and fcf_old and fcf_old > 0:
+                    fcf_growth = (fcf_current - fcf_old) / abs(fcf_old)
+                    if earnings_growth and earnings_growth > 0:
+                        fcf_conversion = fcf_growth / earnings_growth
+                        details["FCF Backs Growth"] = fcf_conversion > 0.8
+                        if fcf_conversion > 0.8:
+                            quality_score += 1
+                    else:
+                        details["FCF Backs Growth"] = fcf_current > 0
+                        if fcf_current > 0:
+                            quality_score += 1
+                else:
+                    details["FCF Backs Growth"] = None
+            else:
+                details["FCF Backs Growth"] = None
+        except Exception:
+            details["FCF Backs Growth"] = None
+
+        return {
+            "Growth Quality Score": quality_score,
+            "Margin Trend": details.get("Margin Trend"),
+            "Operating Leverage": details.get("Operating Leverage"),
+            "FCF Backs Growth": details.get("FCF Backs Growth"),
+        }
+
+    except Exception as e:
+        logger.debug(f"Growth quality calculation failed: {str(e)}")
+        return {
+            "Growth Quality Score": None,
+            "Margin Trend": None,
+            "Operating Leverage": None,
+            "FCF Backs Growth": None,
         }
 
 
@@ -2130,9 +2318,11 @@ def calculate_pfcf(
 
 def calculate_roic(ticker: yf.Ticker) -> Optional[float]:
     """
-    Calculate Return on Invested Capital (ROIC) using NOPAT method.
-    ROIC = NOPAT / Invested Capital
+    Calculate Return on Invested Capital (ROIC) using enhanced NOPAT method.
+    ROIC = NOPAT / Average Invested Capital
     NOPAT = EBIT * (1 - Tax Rate)
+    Invested Capital = Total Debt + Total Equity - Excess Cash
+    Excess Cash = max(0, Total Cash - 3% of Revenue)
     """
     try:
         income = ticker.financials
@@ -2141,7 +2331,7 @@ def calculate_roic(ticker: yf.Ticker) -> Optional[float]:
         if income.empty or balance.empty:
             return None
 
-        # Get EBIT
+        # Get EBIT (prefer most recent, but validate)
         if "EBIT" in income.index:
             ebit = income.loc["EBIT"].iloc[0]
         elif "Operating Income" in income.index:
@@ -2149,38 +2339,73 @@ def calculate_roic(ticker: yf.Ticker) -> Optional[float]:
         else:
             return None
 
-        # Calculate tax rate
+        if pd.isna(ebit) or ebit is None:
+            return None
+
+        # Calculate effective tax rate
         if "Tax Provision" in income.index and "Pretax Income" in income.index:
             tax = income.loc["Tax Provision"].iloc[0]
             pretax = income.loc["Pretax Income"].iloc[0]
-            if pretax and pretax > 0:
-                tax_rate = tax / pretax
+            if pretax and pretax > 0 and not pd.isna(tax):
+                tax_rate = max(0, min(0.40, tax / pretax))  # Cap at 0-40%
             else:
-                tax_rate = 0.21  # Default corporate tax rate
+                tax_rate = 0.21
         else:
             tax_rate = 0.21
 
         nopat = ebit * (1 - tax_rate)
 
-        # Calculate Invested Capital = Total Debt + Total Equity
-        total_debt = 0
-        if "Total Debt" in balance.index:
-            total_debt = balance.loc["Total Debt"].iloc[0] or 0
+        # Get revenue for excess cash calculation
+        revenue = 0
+        for key in ["Total Revenue", "Revenue", "Net Sales"]:
+            if key in income.index:
+                revenue = income.loc[key].iloc[0] or 0
+                break
 
-        total_equity = 0
-        if "Total Equity Gross Minority Interest" in balance.index:
-            total_equity = (
-                balance.loc["Total Equity Gross Minority Interest"].iloc[0] or 0
-            )
-        elif "Stockholders Equity" in balance.index:
-            total_equity = balance.loc["Stockholders Equity"].iloc[0] or 0
+        # Calculate current period invested capital
+        def get_invested_capital(bs, period_idx=0):
+            if len(bs.columns) <= period_idx:
+                return None
 
-        invested_capital = total_debt + total_equity
+            debt = 0
+            if "Total Debt" in bs.index:
+                debt = bs.loc["Total Debt"].iloc[period_idx] or 0
 
-        if invested_capital <= 0:
+            equity = 0
+            if "Total Equity Gross Minority Interest" in bs.index:
+                equity = bs.loc["Total Equity Gross Minority Interest"].iloc[period_idx] or 0
+            elif "Stockholders Equity" in bs.index:
+                equity = bs.loc["Stockholders Equity"].iloc[period_idx] or 0
+
+            # Get cash for excess cash calculation
+            cash = 0
+            for key in ["Cash And Cash Equivalents", "Cash", "Cash And Short Term Investments"]:
+                if key in bs.index:
+                    cash = bs.loc[key].iloc[period_idx] or 0
+                    break
+
+            # Excess cash = cash beyond 3% of revenue (operating cash needs)
+            operating_cash_need = revenue * 0.03
+            excess_cash = max(0, cash - operating_cash_need)
+
+            # Invested Capital = Debt + Equity - Excess Cash
+            invested_capital = debt + equity - excess_cash
+            return invested_capital
+
+        current_ic = get_invested_capital(balance, 0)
+        prior_ic = get_invested_capital(balance, 1) if len(balance.columns) > 1 else current_ic
+
+        if current_ic is None or current_ic <= 0:
             return None
 
-        return safe_divide(nopat, invested_capital)
+        # Use average invested capital for more accurate ROIC
+        if prior_ic and prior_ic > 0:
+            avg_invested_capital = (current_ic + prior_ic) / 2
+        else:
+            avg_invested_capital = current_ic
+
+        roic = safe_divide(nopat, avg_invested_capital)
+        return roic if roic is not None and np.isfinite(roic) else None
 
     except Exception as e:
         logger.warning(f"ROIC calculation failed for {ticker.ticker}: {str(e)}")
@@ -3208,8 +3433,8 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             # Fetch earnings surprise data
             earnings_surprise_data = fetch_earnings_surprise(ticker)
 
-            # Fetch news sentiment data
-            news_sentiment_data = analyze_sentiment_with_ai(symbol, ticker)
+            # Fetch news data (sentiment analysis removed)
+            news_sentiment_data = get_news_data(symbol, ticker)
 
             # Calculate valuation consistency (needs all valuation data)
             valuation_consistency = check_valuation_consistency(
@@ -3610,14 +3835,9 @@ def parse_args():
         help="Max number of tickers to request from the Stage 1 API filter.",
     )
     parser.add_argument(
-        "--skip-ai",
+        "--skip-summary",
         action="store_true",
-        help="Disable OpenAI-powered features (sentiment & thesis).",
-    )
-    parser.add_argument(
-        "--skip-advice",
-        action="store_true",
-        help="Skip AI-powered investment advice generation.",
+        help="Skip investment summary generation.",
     )
     parser.add_argument(
         "--skip-portfolio",
@@ -3651,12 +3871,6 @@ def main():
     print("\n" + "=" * 60)
     print("       GARP STOCK SCREENER - Two-Stage Implementation")
     print("=" * 60)
-
-    global openai_client
-    if args.skip_ai or not OPENAI_API_KEY:
-        if not OPENAI_API_KEY and not args.skip_ai:
-            print("OpenAI key not provided; AI features disabled.")
-        openai_client = None
 
     # Stage 1: Fast API filtering (or manual tickers)
     if args.tickers:
@@ -3725,9 +3939,9 @@ def main():
             weights = (portfolio_df["Weight (%)"] / 100.0).tolist()
             backtest_portfolio(tickers, weights)
 
-    if not passed_df.empty and not args.skip_advice:
-        # Generate AI-powered investment advice
-        advice_df = generate_investment_advice(passed_df)
+    if not passed_df.empty and not args.skip_summary:
+        # Generate investment summaries
+        advice_df = generate_stock_summaries(passed_df)
 
         # Generate Professional PDF Report
         if not args.skip_pdf:

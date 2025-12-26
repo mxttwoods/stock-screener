@@ -1,5 +1,5 @@
 market_cap:
-  min: 2000000000 # 20B
+  min: 20000000000 # 20B
   max: 400000000000000 # 4T
 beta:
   min: 0.50
@@ -8,6 +8,8 @@ valuation:
   pe_max: 50.0
   peg_max: 3.0
   pfcf_max: 75.0
+  margin_of_safety: 0.25 # Graham margin of safety for buy-below price
+  dcf_scenarios: true # Enable bull/bear/base DCF scenario analysis
 profitability:
   roe_min_pct: 6.0 # 10
   roa_min_pct: 5.0
@@ -25,14 +27,27 @@ balance_sheet:
   current_ratio_max: 5.0
 analyst:
   acceptable_ratings:
-  - buy
-  - strong_buy
-  - outperform
-  - hold
+    - buy
+    - strong_buy
+    - outperform
+    - hold
 excluded_symbols:
-- GME
-- AMC
+  - GME
+  - AMC
 excluded_sectors:
-- Energy
-- Basic Materials
-- Utilities
+  - Energy
+  - Basic Materials
+  - Utilities
+
+quality:
+  growth_quality_weight: 1.0 # Weight for growth quality in scoring
+  quality_trend_lookback_years: 1 # Years to look back for trend analysis
+
+conviction:
+  # Category weights (should sum to 100)
+  valuation_weight: 25
+  quality_weight: 30
+  growth_weight: 20
+  technical_weight: 15
+  sentiment_weight: 10
+  risk_penalty_per_flag: 3 # Points deducted per risk warning

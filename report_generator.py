@@ -79,7 +79,8 @@ class ResearchReport(FPDF):
             self.cell(0, 8, f"- {stock['Name']}", 0, 1)
 
             self.set_font("Helvetica", "I", 10)
-            self.multi_cell(0, 6, f"Thesis: {stock['AI Thesis'][:200]}...")
+            summary = stock.get('Investment Summary', 'No summary available')
+            self.multi_cell(0, 6, f"Summary: {str(summary)[:200]}...")
             self.ln(5)
 
     def portfolio_allocation(self, portfolio_df):
@@ -222,11 +223,11 @@ class ResearchReport(FPDF):
 
         self.ln(5)
 
-        # Investment Thesis
+        # Investment Summary
         self.set_font("Helvetica", "B", 12)
-        self.cell(0, 8, "Investment Thesis (AI Analyst)", 0, 1)
+        self.cell(0, 8, "Investment Summary", 0, 1)
         self.set_font("Helvetica", "", 11)
-        self.multi_cell(0, 6, str(stock_data.get("AI Thesis", "No thesis generated.")))
+        self.multi_cell(0, 6, str(stock_data.get("Investment Summary", "No summary available.")))
         self.ln(10)
 
         # Risk Factors
