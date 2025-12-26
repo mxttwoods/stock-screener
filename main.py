@@ -66,12 +66,18 @@ PFCF_MAX = CONFIG["valuation"]["pfcf_max"]
 
 # Stage 1 Constants (API expects Percentages)
 GROWTH_MIN_PCT = CONFIG["growth"]["revenue_growth_min_pct"]
+EBITDA_GROWTH_MIN_PCT = CONFIG["growth"].get(
+    "ebitda_growth_min_pct", 6.0
+)  # Per RULES.md line 33
 ROIC_MIN_PCT = CONFIG["profitability"]["roic_min_pct"]
 ROE_MIN_PCT = CONFIG["profitability"]["roe_min_pct"]
 ROA_MIN_PCT = CONFIG["profitability"]["roa_min_pct"]
 GROSS_MARGIN_MIN_PCT = CONFIG["profitability"]["gross_margin_min_pct"]
 OPERATING_MARGIN_MIN_PCT = CONFIG["profitability"]["operating_margin_min_pct"]
 CURRENT_RATIO_MAX_PCT = CONFIG["balance_sheet"]["current_ratio_max"]
+INTEREST_COVERAGE_MIN = CONFIG["balance_sheet"].get(
+    "interest_coverage_min", 3.0
+)  # Per RULES.md line 50-54
 BETA_MAX = CONFIG["beta"]["max"]
 BETA_MIN = CONFIG["beta"]["min"]
 
@@ -101,12 +107,15 @@ RISK_PENALTY_PER_FLAG = CONVICTION_WEIGHTS.get("risk_penalty_per_flag", 3)
 
 # Sector-specific tolerance factors
 SECTOR_TOLERANCES = CONFIG.get("sector_tolerances", {})
-DEFAULT_SECTOR_TOLERANCE = SECTOR_TOLERANCES.get("default", {
-    "pe_tolerance": 1.2,
-    "ps_tolerance": 1.1,
-    "growth_premium": 1.0,
-    "pb_tolerance": 1.1
-})
+DEFAULT_SECTOR_TOLERANCE = SECTOR_TOLERANCES.get(
+    "default",
+    {
+        "pe_tolerance": 1.2,
+        "ps_tolerance": 1.1,
+        "growth_premium": 1.0,
+        "pb_tolerance": 1.1,
+    },
+)
 
 # Liquidity requirements
 LIQUIDITY_CONFIG = CONFIG.get("liquidity", {})
@@ -300,6 +309,7 @@ def get_ticker(symbol: str) -> yf.Ticker:
 # =============================================================================
 # NEW HELPER FUNCTIONS FOR IMPROVED FINANCIAL ADVICE
 # =============================================================================
+
 
 def get_sector_tolerance(sector: str) -> dict:
     """
@@ -583,15 +593,15 @@ def load_sector_metrics_cache() -> dict:
     """Load sector metrics from persistent cache file."""
     try:
         if os.path.exists(_SECTOR_METRICS_CACHE_FILE):
-            with open(_SECTOR_METRICS_CACHE_FILE, 'rb') as f:
+            with open(_SECTOR_METRICS_CACHE_FILE, "rb") as f:
                 cache = pickle.load(f)
 
             # Check if cache is still valid
-            cache_time = cache.get('timestamp')
+            cache_time = cache.get("timestamp")
             if cache_time:
                 age_hours = (datetime.now() - cache_time).total_seconds() / 3600
                 if age_hours < _SECTOR_CACHE_TTL_HOURS:
-                    return cache.get('data', {})
+                    return cache.get("data", {})
         return {}
     except Exception as e:
         logger.debug(f"Failed to load sector metrics cache: {e}")
@@ -601,17 +611,16 @@ def load_sector_metrics_cache() -> dict:
 def save_sector_metrics_cache(data: dict):
     """Save sector metrics to persistent cache file."""
     try:
-        cache = {
-            'timestamp': datetime.now(),
-            'data': data
-        }
-        with open(_SECTOR_METRICS_CACHE_FILE, 'wb') as f:
+        cache = {"timestamp": datetime.now(), "data": data}
+        with open(_SECTOR_METRICS_CACHE_FILE, "wb") as f:
             pickle.dump(cache, f)
     except Exception as e:
         logger.debug(f"Failed to save sector metrics cache: {e}")
 
 
-def calculate_var(returns: pd.Series, confidence: float = 0.95, horizon_days: int = 20) -> dict:
+def calculate_var(
+    returns: pd.Series, confidence: float = 0.95, horizon_days: int = 20
+) -> dict:
     """
     Calculate Value at Risk (VaR) using historical simulation method.
 
@@ -653,7 +662,7 @@ def calculate_var(returns: pd.Series, confidence: float = 0.95, horizon_days: in
             "CVaR (%)": round(abs(cvar), 2) if not np.isnan(cvar) else None,
             "VaR Signal": signal,
             "VaR Horizon Days": horizon_days,
-            "VaR Confidence": f"{confidence*100:.0f}%",
+            "VaR Confidence": f"{confidence * 100:.0f}%",
         }
     except Exception as e:
         logger.debug(f"VaR calculation failed: {e}")
@@ -768,7 +777,7 @@ def get_sector_median_metrics(sector: str) -> dict:
     if not etf_ticker:
         return {}
 
-    print(f"  Calculating medians for {sector} sector using {etf_ticker} holdings...")
+    # Removed verbose sector median calculation message
     try:
         etf = yf.Ticker(etf_ticker)
         # Fix: Use funds_data.top_holdings as .holdings is deprecated/unreliable
@@ -1900,11 +1909,11 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
 
     # Apply weights from config
     weighted_score = (
-        (valuation_score * VALUATION_WEIGHT / 100) +
-        (quality_score * QUALITY_WEIGHT / 100) +
-        (growth_score * GROWTH_WEIGHT / 100) +
-        (technical_score * TECHNICAL_WEIGHT / 100) +
-        (sentiment_score * SENTIMENT_WEIGHT / 100)
+        (valuation_score * VALUATION_WEIGHT / 100)
+        + (quality_score * QUALITY_WEIGHT / 100)
+        + (growth_score * GROWTH_WEIGHT / 100)
+        + (technical_score * TECHNICAL_WEIGHT / 100)
+        + (sentiment_score * SENTIMENT_WEIGHT / 100)
     )
 
     # Add bonus/penalty
@@ -1918,7 +1927,9 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
     weighted_score -= risk_penalty
 
     if risk_penalty > 0:
-        reasons.append(f"Risk penalty applied: -{risk_penalty} ({risk_flag_count} flags)")
+        reasons.append(
+            f"Risk penalty applied: -{risk_penalty} ({risk_flag_count} flags)"
+        )
 
     # Final clamping
     final_score = int(max(0, min(100, weighted_score)))
@@ -2297,7 +2308,7 @@ def walk_forward_backtest(
     weights: list,
     n_windows: int = None,
     train_months: int = None,
-    test_months: int = None
+    test_months: int = None,
 ) -> dict:
     """
     Walk-forward backtesting for more robust performance analysis.
@@ -2321,7 +2332,9 @@ def walk_forward_backtest(
     benchmark = BENCHMARK_SYMBOL
 
     print("\n" + "=" * 60)
-    print(f"WALK-FORWARD BACKTEST ({n_windows} windows: {train_months}M train, {test_months}M test)")
+    print(
+        f"WALK-FORWARD BACKTEST ({n_windows} windows: {train_months}M train, {test_months}M test)"
+    )
     print("=" * 60)
 
     try:
@@ -2338,11 +2351,7 @@ def walk_forward_backtest(
         print(f"  Downloading {period} of data for {len(all_symbols)} symbols...")
 
         data = yf.download(
-            all_symbols,
-            period=period,
-            interval="1d",
-            progress=False,
-            auto_adjust=True
+            all_symbols, period=period, interval="1d", progress=False, auto_adjust=True
         )
 
         if "Close" in data.columns and isinstance(data.columns, pd.MultiIndex):
@@ -2398,32 +2407,46 @@ def walk_forward_backtest(
                 port_test_ret = port_test_ret / total_weight
 
             # Benchmark returns
-            bench_test_ret = test_returns[benchmark] if benchmark in test_returns.columns else pd.Series(0.0)
+            bench_test_ret = (
+                test_returns[benchmark]
+                if benchmark in test_returns.columns
+                else pd.Series(0.0)
+            )
 
             # Calculate metrics for this window
             port_total = (1 + port_test_ret).prod() - 1
             bench_total = (1 + bench_test_ret).prod() - 1
 
             # Sharpe ratio
-            port_sharpe = (port_test_ret.mean() / port_test_ret.std()) * np.sqrt(252) if port_test_ret.std() > 0 else 0
+            port_sharpe = (
+                (port_test_ret.mean() / port_test_ret.std()) * np.sqrt(252)
+                if port_test_ret.std() > 0
+                else 0
+            )
 
             # Max drawdown
             port_cum = (1 + port_test_ret).cumprod()
             port_dd = ((port_cum / port_cum.cummax()) - 1).min()
 
-            window_results.append({
-                "window": window + 1,
-                "test_start": test_returns.index[0].strftime("%Y-%m-%d"),
-                "test_end": test_returns.index[-1].strftime("%Y-%m-%d"),
-                "portfolio_return": port_total * 100,
-                "benchmark_return": bench_total * 100,
-                "alpha": (port_total - bench_total) * 100,
-                "sharpe": port_sharpe,
-                "max_drawdown": port_dd * 100,
-            })
+            window_results.append(
+                {
+                    "window": window + 1,
+                    "test_start": test_returns.index[0].strftime("%Y-%m-%d"),
+                    "test_end": test_returns.index[-1].strftime("%Y-%m-%d"),
+                    "portfolio_return": port_total * 100,
+                    "benchmark_return": bench_total * 100,
+                    "alpha": (port_total - bench_total) * 100,
+                    "sharpe": port_sharpe,
+                    "max_drawdown": port_dd * 100,
+                }
+            )
 
-            print(f"  Window {window + 1}: {window_results[-1]['test_start']} to {window_results[-1]['test_end']}")
-            print(f"    Portfolio: {port_total*100:+.1f}%  |  {benchmark}: {bench_total*100:+.1f}%  |  Alpha: {(port_total-bench_total)*100:+.1f}%")
+            print(
+                f"  Window {window + 1}: {window_results[-1]['test_start']} to {window_results[-1]['test_end']}"
+            )
+            print(
+                f"    Portfolio: {port_total * 100:+.1f}%  |  {benchmark}: {bench_total * 100:+.1f}%  |  Alpha: {(port_total - bench_total) * 100:+.1f}%"
+            )
 
         if not window_results:
             print("  No valid windows found.")
@@ -2434,7 +2457,9 @@ def walk_forward_backtest(
         avg_alpha = np.mean([w["alpha"] for w in window_results])
         avg_sharpe = np.mean([w["sharpe"] for w in window_results])
         avg_dd = np.mean([w["max_drawdown"] for w in window_results])
-        win_rate = sum(1 for w in window_results if w["alpha"] > 0) / len(window_results) * 100
+        win_rate = (
+            sum(1 for w in window_results if w["alpha"] > 0) / len(window_results) * 100
+        )
 
         # Standard deviation of results (consistency)
         std_return = np.std([w["portfolio_return"] for w in window_results])
@@ -2444,7 +2469,9 @@ def walk_forward_backtest(
         print("  WALK-FORWARD SUMMARY:")
         print("-" * 40)
         print(f"  Avg Portfolio Return:  {avg_return:+.1f}% (+/- {std_return:.1f}%)")
-        print(f"  Avg Alpha vs {benchmark}:     {avg_alpha:+.1f}% (+/- {std_alpha:.1f}%)")
+        print(
+            f"  Avg Alpha vs {benchmark}:     {avg_alpha:+.1f}% (+/- {std_alpha:.1f}%)"
+        )
         print(f"  Avg Sharpe Ratio:      {avg_sharpe:.2f}")
         print(f"  Avg Max Drawdown:      {avg_dd:.1f}%")
         print(f"  Win Rate (Beat {benchmark}): {win_rate:.0f}%")
@@ -2477,9 +2504,7 @@ def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
     """
     Generate structured investment summaries for all passing stocks.
     """
-    print("\n" + "=" * 60)
-    print("INVESTMENT SUMMARY - Metrics-Based Analysis")
-    print("=" * 60)
+    # Removed verbose header
 
     if passed_df.empty:
         print("No stocks to analyze.")
@@ -2524,7 +2549,7 @@ def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
 
         symbol = stock_data.get("Symbol", "Unknown")
 
-        print(f"  Generating advice for {symbol}...", end=" ")
+        # Removed verbose advice generation message
 
         # Get additional ticker info for risk warnings
         try:
@@ -2571,25 +2596,15 @@ def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
 
         advice_data.append(advice_row)
 
-        print(f"{action} (Conviction: {conviction}/100)")
-
     advice_df = pd.DataFrame(advice_data)
 
-    # Display summary
-    print("\n" + "-" * 60)
-    print("INVESTMENT RECOMMENDATIONS SUMMARY")
-    print("-" * 60)
-
+    # Display concise summary
+    print("\nRecommendations:")
     for _, row in advice_df.iterrows():
-        print(f"\n{row['Symbol']} - {row['Name']}")
-        print(f"  Action: {row['Action']} | Conviction: {row['Conviction']}/100")
-        print(f"  Summary: {row['Investment Summary']}")
-        if row["Risk Warnings"] != "None":
-            print(f"  Risks: {row['Risk Warnings']}")
+        print(f"  {row['Symbol']}: {row['Action']} ({row['Conviction']}/100)")
 
-    # Export summary
+    # Export summary (silent)
     advice_df.to_csv("investment_summary.csv", index=False)
-    print("\n\nInvestment summary exported to: investment_summary.csv")
 
     return advice_df
 
@@ -3099,38 +3114,37 @@ def build_stage1_query() -> EquityQuery:
     """
     Stage 1: Build composite EquityQuery for fast API filtering.
     Filters: Market Cap, Positive EPS, P/E, PEG, D/E, ROE, Revenue Growth, EBITDA Growth
+    Per RULES.md and IDEAS.md requirements.
     """
     filters = [
         # Region: US only
         EquityQuery("eq", ["region", "us"]),
         # Exchange: ASE, BTS, CXI, NCM, NGM, NMS, NYQ, OEM, OQB, OQX, PCX, PNK, YHD
         EquityQuery("is-in", ["exchange", "NMS", "NYQ"]),
-        # Market Cap: $1B - $500B
+        # Market Cap: $1B - $500B (per RULES.md line 7)
         EquityQuery(
             "btwn", ["lastclosemarketcap.lasttwelvemonths", MCAP_MIN, MCAP_MAX]
         ),
-        # Positive EPS
+        # Positive EPS (per RULES.md line 8)
         EquityQuery("gte", ["basicepscontinuingoperations.lasttwelvemonths", 0.001]),
-        EquityQuery("gte", ["epsgrowth.lasttwelvemonths", GROWTH_MIN]),
-        # P/E < 50
+        # EPS Growth >= 6% (per RULES.md line 32)
+        EquityQuery("gte", ["epsgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # P/E < 50 (per RULES.md line 13)
         EquityQuery("btwn", ["peratio.lasttwelvemonths", 0, PE_MAX]),
-        # PEG < 3
+        # PEG < 1.1 (per RULES.md line 16-22, strict requirement)
         EquityQuery("lte", ["pegratio_5y", PEG_MAX]),
-        # D/E < 100 (1.0)
+        # D/E < 0.5 (per RULES.md line 9-11)
+        # Note: yfinance API expects percentage format, so 0.5 ratio = 50%
         EquityQuery("btwn", ["totaldebtequity.lasttwelvemonths", 0, (DE_MAX * 100)]),
-        # ROE >= 10%
+        # ROE >= 15% (per RULES.md line 41-45)
         EquityQuery("gte", ["returnonequity.lasttwelvemonths", ROE_MIN_PCT]),
-        # ROIC Proxy (Return on Total Capital) >= 7%
+        # ROIC Proxy (Return on Total Capital) >= 10% (per RULES.md line 41-45)
         EquityQuery("gte", ["returnontotalcapital.lasttwelvemonths", ROIC_MIN_PCT]),
-        # Revenue Growth >= 6%
+        # Revenue Growth >= 6% (per RULES.md line 31)
         EquityQuery("gte", ["totalrevenues1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
         EquityQuery("gte", ["quarterlyrevenuegrowth.quarterly", GROWTH_MIN_PCT]),
-        # EBITDA Growth >= 6%
-        # EquityQuery("gte", ["ebitda1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
-        # Net Income Growth >= 6%
-        # EquityQuery("gte", ["netincome1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
-        # Diluted EPS Growth >= 6%
-        # EquityQuery("gte", ["dilutedeps1yrgrowth.lasttwelvemonths", GROWTH_MIN_PCT]),
+        # EBITDA Growth >= 6% (per RULES.md line 33) - NOW ENABLED
+        EquityQuery("gte", ["ebitda1yrgrowth.lasttwelvemonths", EBITDA_GROWTH_MIN_PCT]),
         # Current Ratio >= 1.0 (Liquidity)
         EquityQuery(
             "btwn", ["currentratio.lasttwelvemonths", 1, CURRENT_RATIO_MAX_PCT]
@@ -3143,11 +3157,9 @@ def build_stage1_query() -> EquityQuery:
         ),
         # Operating Margin >= 15% (efficiency)
         EquityQuery("gte", ["ebitdamargin.lasttwelvemonths", OPERATING_MARGIN_MIN_PCT]),
-        # ROE >= 10%
-        EquityQuery("gte", ["returnonequity.lasttwelvemonths", ROE_MIN_PCT]),
-        # Beta >= 1.0 (Liquidity)
+        # Beta between 0.5 and 2.5
         EquityQuery("btwn", ["beta", BETA_MIN, BETA_MAX]),
-        # fiftytwowkpercentchange
+        # 52-week price change filter
         EquityQuery(
             "btwn",
             [
@@ -3197,6 +3209,10 @@ def run_stage1(limit: int = DEFAULT_STAGE1_SIZE) -> pd.DataFrame:
                 print(
                     f"  Excluded {excluded_count} stocks based on your symbol exclusion list."
                 )
+
+        # Note: S&P 500/NASDAQ-100 filtering removed - cannot reliably source all constituents.
+        # Stocks are already filtered by exchange (NYSE/NASDAQ) and market cap ($1B-$500B),
+        # which ensures mid-to-large cap US stocks as per RULES.md requirements.
 
         return df
 
@@ -4735,16 +4751,12 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     results = []
     tickers = stage1_df["symbol"].tolist() if "symbol" in stage1_df.columns else []
     risk_free_rate = fetch_treasury_yield()
-    print(f"  Using Risk-Free Rate (10Y Treasury): {risk_free_rate * 100:.2f}%")
 
     # Define relative tolerance from config, with a fallback
     SECTOR_TOLERANCE = CONFIG.get("sector_relative_tolerance", 1.2)  # e.g., 20% premium
 
     # Phase 3: Batch fetch historical data for technicals and ML
-    print(f"  Batch fetching 1Y price history for {len(tickers)} tickers...")
     try:
-        # We need historical data for ML training (last ~2 years is better but 1y is okay for now)
-        # Extending to 2y for better ML training
         batch_history = yf.download(
             tickers + ["SPY"],
             period="2y",
@@ -4753,7 +4765,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             group_by="ticker",
         )
     except Exception as e:
-        print(f"  Batch download failed: {e}. Falling back to individual.")
+        logger.debug(f"Batch download failed: {e}")
         batch_history = pd.DataFrame()
 
     # Initialize ML Engine
@@ -4761,38 +4773,25 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
 
     ml_predictor = None
     if not batch_history.empty:
-        # Convert batch_history MultiIndex to dict of DataFrames {ticker: df}
-        print("  Initializing Quant-ML Alpha Predictor...", end=" ")
         data_dict = {}
-        # Handle the structure of yf.download result
-        # If multiple tickers: columns are (Ticker, PriceType) or (PriceType, Ticker) ?
-        # usually group_by='ticker' -> Level 0 is Ticker.
-
-        # Check structure
         if isinstance(batch_history.columns, pd.MultiIndex):
-            # Level 0 is Ticker if group_by='ticker'
             for t in tickers + ["SPY"]:
                 try:
                     if t in batch_history.columns.levels[0]:
                         data_dict[t] = batch_history[t]["Close"]
                 except KeyError:
                     pass
-        else:
-            # Single ticker case
-            pass
 
         if len(data_dict) > 1:
             try:
                 ml_predictor = AlphaPredictor(data_dict, benchmark_symbol="SPY")
                 ml_predictor.train_model()
             except Exception as e:
-                logger.warning(f"ML Training failed: {str(e)}")
+                logger.debug(f"ML Training failed: {str(e)}")
                 ml_predictor = None
-        else:
-            print("Insufficient data for ML.")
 
+    print(f"  Analyzing {len(tickers)} stocks...")
     for i, symbol in enumerate(tickers):
-        print(f"  Analyzing {symbol} ({i + 1}/{len(tickers)})...", end=" ")
         try:
             ticker = get_ticker(symbol)
             info = ticker.info
@@ -4803,24 +4802,59 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             if not current_sector or current_sector in CONFIG.get(
                 "excluded_sectors", []
             ):
-                print(f"SKIP (Sector: {current_sector or 'N/A'})")
                 continue
 
             market_cap = info.get("marketCap", 0)
             if not market_cap:
-                print("SKIP (no market cap)")
                 continue
 
             # --- Key Metric Calculations ---
             pfcf = calculate_pfcf(ticker, market_cap, info)
             roic = calculate_roic(ticker)
             income = ticker.financials
+            # Revenue CAGR (3-year) - per RULES.md line 34-36
             rev_cagr = (
                 calculate_cagr(income.loc["Total Revenue"].dropna().tolist(), 3)
                 if not income.empty and "Total Revenue" in income.index
                 else None
             )
             rev_cagr_pct = rev_cagr * 100 if rev_cagr is not None else None
+            # EPS CAGR (3-year) - per RULES.md line 34-36, IDEAS.md line 54
+            eps_cagr = None
+            eps_cagr_pct = None
+            if not income.empty:
+                # Try to find EPS data - may need to calculate from Net Income and shares
+                net_income_key = None
+                for key in ["Net Income", "Net Income Common Stockholders"]:
+                    if key in income.index:
+                        net_income_key = key
+                        break
+                if net_income_key:
+                    net_income_values = income.loc[net_income_key].dropna().tolist()
+                    if len(net_income_values) >= 4:  # Need 4 years for 3-year CAGR
+                        shares_outstanding = info.get("sharesOutstanding") or info.get(
+                            "impliedSharesOutstanding"
+                        )
+                        if shares_outstanding and shares_outstanding > 0:
+                            # Approximate EPS from Net Income / Shares
+                            eps_values = [
+                                ni / shares_outstanding for ni in net_income_values[:4]
+                            ]
+                            eps_cagr = calculate_cagr(eps_values, 3)
+                            eps_cagr_pct = (
+                                eps_cagr * 100 if eps_cagr is not None else None
+                            )
+                # Fallback: try to get EPS directly if available
+                if eps_cagr is None:
+                    for key in ["Diluted EPS", "Basic EPS"]:
+                        if key in income.index:
+                            eps_values = income.loc[key].dropna().tolist()
+                            if len(eps_values) >= 4:
+                                eps_cagr = calculate_cagr(eps_values[:4], 3)
+                                eps_cagr_pct = (
+                                    eps_cagr * 100 if eps_cagr is not None else None
+                                )
+                                break
 
             # --- NEW: Enhanced Quality & Valuation Metrics ---
             piotroski = calculate_piotroski_score(ticker)
@@ -4833,6 +4867,10 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             accounting_flags = detect_accounting_red_flags(ticker)
             debt_maturity = analyze_debt_maturity_risk(ticker, info)
             dividend_analysis = check_dividend_sustainability(ticker, info)
+            # Interest Coverage (per RULES.md line 50-54)
+            interest_coverage_data = calculate_interest_coverage(ticker)
+            # Growth Quality (includes FCF trend) - per RULES.md line 38-40, line 61
+            growth_quality = calculate_growth_quality(ticker)
 
             # --- Sector-Relative Analysis ---
             sector_medians = get_sector_median_metrics(current_sector)
@@ -4902,6 +4940,42 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             if rev_cagr is not None and rev_cagr < CAGR_MIN:
                 passed = False
                 fail_reasons.append(f"3Y Rev CAGR < {CAGR_MIN * 100:.0f}%")
+            # EPS CAGR filter (per RULES.md line 34-36, IDEAS.md line 54)
+            if eps_cagr is not None and eps_cagr < CAGR_MIN:
+                passed = False
+                fail_reasons.append(f"3Y EPS CAGR < {CAGR_MIN * 100:.0f}%")
+            # FCF Trend validation (per RULES.md line 38-40, line 61)
+            fcf_backs_growth = growth_quality.get("FCF Backs Growth")
+            if fcf_backs_growth is False:  # Explicitly False (not None)
+                passed = False
+                fail_reasons.append(
+                    "FCF not backing growth (declining/negative FCF trend)"
+                )
+            # Interest Coverage filter (per RULES.md line 50-54)
+            interest_coverage = interest_coverage_data.get("Interest Coverage")
+            if (
+                interest_coverage is not None
+                and interest_coverage < INTEREST_COVERAGE_MIN
+            ):
+                passed = False
+                fail_reasons.append(
+                    f"Interest Coverage < {INTEREST_COVERAGE_MIN} (EBIT/Interest)"
+                )
+            # EV/EBITDA filter (per RULES.md line 23-25)
+            if ev_ebitda is not None and ev_ebitda > 10:  # EV/EBITDA > 10 is expensive
+                # Allow higher EV/EBITDA if growth justifies it
+                growth_justifies = False
+                if peg_ratio is not None and peg_ratio <= 1.5:
+                    growth_justifies = True
+                if rev_cagr_pct is not None and rev_cagr_pct >= (CAGR_MIN * 100 * 1.5):
+                    growth_justifies = True
+                if growth_est_pct is not None and growth_est_pct >= 15:
+                    growth_justifies = True
+                if not growth_justifies:
+                    passed = False
+                    fail_reasons.append(
+                        f"EV/EBITDA too high ({ev_ebitda:.1f}) without growth justification"
+                    )
             if rating and rating not in ACCEPTABLE_RATINGS:
                 passed = False
                 fail_reasons.append(f"Rating:{rating}")
@@ -4934,8 +5008,10 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 fail_reasons.append("ROE < Sector Median")
 
             # --- Compile Data ---
-            status = "PASS" if passed else f"FAIL ({', '.join(fail_reasons)})"
-            print(status)
+            # Only print status for passed stocks or if verbose
+            if passed:
+                print(f"  ✓ {symbol}: PASS")
+            # Failures are logged but not printed to reduce noise
 
             current_price = info.get("currentPrice")
             de_ratio = info.get("debtToEquity")
@@ -4975,11 +5051,12 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             options_iv = get_options_implied_volatility(ticker, info)
             week_52_position = get_52_week_position(info)
             fcf_yield_data = calculate_fcf_yield(ticker, info, risk_free_rate)
-            growth_quality = calculate_growth_quality(ticker)
+            # growth_quality already calculated earlier for filtering
 
             # --- NEW: Enhanced Financial Health Metrics ---
             liquidity_data = check_liquidity(info)
-            interest_coverage_data = calculate_interest_coverage(ticker)
+            # interest_coverage_data already calculated earlier for filtering
+            # growth_quality already calculated earlier for filtering
             current_ratio_data = calculate_current_ratio_trend(ticker)
             data_quality_data = assess_data_quality(ticker, info)
 
@@ -5025,6 +5102,8 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 "52W High": fifty_two_high,
                 "Current Price": current_price,
                 "3Y Rev CAGR (%)": rev_cagr_pct or 0,
+                "3Y EPS CAGR (%)": eps_cagr_pct
+                or None,  # Per RULES.md line 34-36, IDEAS.md line 54
                 "Analyst Rating": rating,
                 "# Analysts": num_analysts,
                 "Upside (%)": (
@@ -5111,15 +5190,8 @@ def build_optimized_portfolio(
     Build an optimized portfolio from screener results.
     Objectives: 'sharpe' (default), 'return', 'sortino'
     """
-    print("\n" + "=" * 60)
-    print(f"PORTFOLIO OPTIMIZATION - Objective: Maximize {objective.capitalize()}")
-    print("=" * 60)
-
     # Get unique symbols and sectors
     if passed_df.empty or len(passed_df) < min_stocks:
-        print(
-            f"\nInsufficient stocks ({len(passed_df)}) for optimization. Using fallback strategy."
-        )
         return _build_fallback_portfolio(passed_df)
 
     # Apply sector diversification - max 2 stocks per sector initially
@@ -5280,13 +5352,10 @@ def build_optimized_portfolio(
             np.sqrt(np.dot(best_weights.T, np.dot(cov_matrix, best_weights))) * 100
         )
 
-        print("\nOptimized Portfolio:")
-        print(portfolio_df.to_string(index=False))
-        print("\nPortfolio Metrics:")
-        print(f"  Expected Annual Return: {port_return:.1f}%")
-        print(f"  Expected Volatility: {port_volatility:.1f}%")
-        print(f"  Sharpe Ratio: {best_sharpe:.2f}")
-        print(f"  Max Position: {portfolio_df['Weight (%)'].max():.1f}%")
+        # Simplified portfolio output
+        print(
+            f"\nPortfolio: {port_return:.1f}% return, {port_volatility:.1f}% vol, Sharpe {best_sharpe:.2f}"
+        )
 
         # =================================================================
         # NEW: VaR and Risk Metrics
@@ -5299,15 +5368,12 @@ def build_optimized_portfolio(
             var_metrics = calculate_var(
                 portfolio_returns,
                 confidence=VAR_CONFIDENCE,
-                horizon_days=VAR_HORIZON_DAYS
+                horizon_days=VAR_HORIZON_DAYS,
             )
 
             if var_metrics.get("VaR (%)"):
-                print(f"\nRisk Metrics ({var_metrics.get('VaR Confidence', '95%')} VaR, {VAR_HORIZON_DAYS}-day horizon):")
-                print(f"  Value at Risk (VaR): {var_metrics['VaR (%)']:.1f}%")
-                if var_metrics.get("CVaR (%)"):
-                    print(f"  Conditional VaR (Expected Shortfall): {var_metrics['CVaR (%)']:.1f}%")
-                print(f"  Risk Level: {var_metrics.get('VaR Signal', 'Unknown')}")
+                # VaR metrics logged but not printed to reduce noise
+                logger.debug(f"Portfolio VaR: {var_metrics.get('VaR (%)', 0):.1f}%")
 
                 # Max drawdown from historical data
                 cumulative = (1 + portfolio_returns).cumprod()
@@ -5337,12 +5403,9 @@ def build_optimized_portfolio(
                 cost = estimate_transaction_costs(weight, mcap_value)
                 total_cost_bps += cost * weight
 
-            print(f"  Estimated Round-Trip Cost: {total_cost_bps:.1f} bps ({total_cost_bps/100:.2f}%)")
-            print(f"  Impact on Annual Return: -{total_cost_bps/100:.2f}% (if rebalancing quarterly)")
-
-            # Net return after costs
-            net_return = port_return - (total_cost_bps / 100 * 4)  # Quarterly rebalancing
-            print(f"  Net Expected Return (after costs): {net_return:.1f}%")
+            # Transaction costs calculated but not printed
+            net_return = port_return - (total_cost_bps / 100 * 4)
+            logger.debug(f"Net return after costs: {net_return:.1f}%")
 
         except Exception as e:
             logger.debug(f"Transaction cost calculation failed: {e}")
@@ -5373,15 +5436,12 @@ def build_optimized_portfolio(
                 avg_corr = corr_matrix.values[
                     np.triu_indices_from(corr_matrix.values, k=1)
                 ].mean()
-                print(
-                    f"\n✓ Portfolio Diversification: Avg Correlation = {avg_corr:.2f}"
-                )
+                print(logger.debug(f"Portfolio avg correlation: {avg_corr:.2f}"))
         except Exception:
             pass  # Skip correlation if calculation fails
 
-        # Export portfolio
+        # Export portfolio (silent)
         portfolio_df.to_csv("portfolio_allocation.csv", index=False)
-        print("\nPortfolio exported to: portfolio_allocation.csv")
 
         return portfolio_df
 
@@ -5395,7 +5455,7 @@ def _build_fallback_portfolio(passed_df: pd.DataFrame) -> pd.DataFrame:
     Fallback portfolio: equal weight with stock picks + BIL + TLT.
     Used when fewer than 4 stocks pass screening.
     """
-    print("\nBuilding fallback portfolio with BIL (T-bills) and TLT (20-yr bonds)...")
+    # Removed verbose fallback message
 
     # Get any passing stocks
     stock_symbols = passed_df["Symbol"].tolist() if not passed_df.empty else []
@@ -5422,9 +5482,8 @@ def _build_fallback_portfolio(passed_df: pd.DataFrame) -> pd.DataFrame:
     print("\nFallback Portfolio (Equal Weight):")
     print(portfolio_df.to_string(index=False))
 
-    # Export
+    # Export (silent)
     portfolio_df.to_csv("portfolio_allocation.csv", index=False)
-    print("\nPortfolio exported to: portfolio_allocation.csv")
 
     return portfolio_df
 
@@ -5441,11 +5500,7 @@ def _build_equal_weight_portfolio(symbols: list) -> pd.DataFrame:
         }
     )
 
-    print("\nEqual Weight Portfolio:")
-    print(portfolio_df.to_string(index=False))
-
     portfolio_df.to_csv("portfolio_allocation.csv", index=False)
-    print("\nPortfolio exported to: portfolio_allocation.csv")
 
     return portfolio_df
 
@@ -5506,6 +5561,13 @@ def main():
     print("       GARP STOCK SCREENER - Two-Stage Implementation")
     print("=" * 60)
 
+    # Log loaded thresholds (debug level to reduce noise)
+    logger.debug(
+        f"GARP Thresholds: Market Cap ${MCAP_MIN / 1e9:.0f}B-${MCAP_MAX / 1e9:.0f}B, "
+        f"P/E<{PE_MAX}, PEG<{PEG_MAX}, P/FCF<{PFCF_MAX}, "
+        f"ROE>{ROE_MIN_PCT}%, ROIC>{ROIC_MIN_PCT}%, D/E<{DE_MAX}"
+    )
+
     # Stage 1: Fast API filtering (or manual tickers)
     if args.tickers:
         print(
@@ -5530,36 +5592,22 @@ def main():
     passed_df = results_df[results_df["Stage 2 Pass"]].copy()
     passed_df = passed_df.sort_values("Conviction Score", ascending=False)
 
-    # Display results
+    # Display concise results
     print("\n" + "=" * 60)
-    print("FINAL RESULTS - Stocks Passing All GARP Criteria")
+    print("RESULTS")
     print("=" * 60)
 
     if passed_df.empty:
         print("No stocks passed all criteria.")
-        print("\nAll Stage 1 candidates (for review):")
-        print(results_df.to_string(index=False))
     else:
-        display_cols = [
-            "Symbol",
-            "Name",
-            "Sector",
-            "Market Cap ($B)",
-            "P/E",
-            "Sector Median P/E",
-            "ROE (%)",
-            "Sector Median ROE",
-            "P/FCF",
-            "ROIC (%)",
-            "3Y Rev CAGR (%)",
-        ]
+        # Show only essential columns
+        display_cols = ["Symbol", "Name", "P/E", "P/FCF", "ROIC (%)", "3Y Rev CAGR (%)"]
         print(passed_df[display_cols].to_string(index=False))
-        print(f"\nTotal: {len(passed_df)} stocks passed all criteria")
+        print(f"\n{len(passed_df)} stocks passed all criteria")
 
-    # Export to CSV
+    # Export to CSV (silent)
     output_file = "screener_results.csv"
     results_df.to_csv(output_file, index=False)
-    print(f"\nFull results for all analyzed stocks exported to: {output_file}")
 
     # Build optimized portfolio from passing stocks
     portfolio_df = pd.DataFrame()
@@ -5598,7 +5646,7 @@ def main():
 
     end_time = time.time()
     elapsed_time = timedelta(seconds=end_time - start_time)
-    print(f"\nTotal runtime: {elapsed_time}")
+    print(f"\nCompleted in {elapsed_time}")
 
 
 if __name__ == "__main__":
