@@ -1,4 +1,5 @@
 from datetime import datetime
+import re
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,95 @@ class ResearchReport(FPDF):
         super().__init__()
         self.set_auto_page_break(auto=True, margin=15)
         self.report_date = datetime.now().strftime("%B %d, %Y")
+
+    def strip_emojis(self, text):
+        """
+        Remove all emoji characters from text for PDF compatibility.
+        """
+        if not text or not isinstance(text, str):
+            return str(text) if text is not None else ""
+
+        # Remove common emojis used in the screener
+        emojis_to_remove = [
+            "🟢",
+            "🟡",
+            "🔵",
+            "⚪",
+            "🔴",  # Action emojis
+            "✓",
+            "⚠️",
+            "⭐",
+            "❗",  # Status emojis
+        ]
+
+        cleaned = text
+        for emoji in emojis_to_remove:
+            cleaned = cleaned.replace(emoji, "")
+
+        # Also remove any other Unicode emoji characters using regex
+        # Remove emoji ranges
+        emoji_pattern = re.compile(
+            "["
+            "\U0001f600-\U0001f64f"  # emoticons
+            "\U0001f300-\U0001f5ff"  # symbols & pictographs
+            "\U0001f680-\U0001f6ff"  # transport & map symbols
+            "\U0001f1e0-\U0001f1ff"  # flags
+            "\U00002702-\U000027b0"  # dingbats
+            "\U000024c2-\U0001f251"  # enclosed characters
+            "]+",
+            flags=re.UNICODE,
+        )
+        cleaned = emoji_pattern.sub("", cleaned)
+
+        return cleaned.strip()
+
+    def safe_multi_cell(
+        self, w, h, txt, border=0, align="J", fill=False, max_length=500
+    ):
+        """
+        Safely render multi-cell text with truncation and error handling.
+        """
+        if not txt:
+            return
+
+        # Convert to string and clean
+        txt_str = str(txt) if txt is not None else ""
+        txt_clean = self.strip_emojis(txt_str)
+
+        # Truncate if too long
+        if len(txt_clean) > max_length:
+            txt_clean = txt_clean[:max_length] + "..."
+
+        # Remove any problematic characters that might cause rendering issues
+        # Keep only printable ASCII and common punctuation
+        try:
+            txt_clean = "".join(
+                c for c in txt_clean if c.isprintable() or c in ["\n", "\r", "\t"]
+            )
+        except Exception:
+            # Fallback: just use ASCII
+            txt_clean = txt_clean.encode("ascii", "ignore").decode("ascii")
+
+        # Ensure we have valid width
+        if w <= 0:
+            w = self.w - self.l_margin - self.r_margin
+
+        try:
+            self.multi_cell(w, h, txt_clean, border, align, fill)
+        except Exception:
+            # Fallback: try with even shorter text
+            try:
+                txt_clean = txt_clean[:200] + "..."
+                self.multi_cell(w, h, txt_clean, border, align, fill)
+            except Exception:
+                # Last resort: just skip this text
+                try:
+                    self.cell(
+                        w, h, "[Text too long to display]", border, 1, align, fill
+                    )
+                except Exception:
+                    # If even that fails, just move to next line
+                    self.ln(h)
 
     def header(self):
         # Logo or Brand Name
@@ -59,12 +149,13 @@ class ResearchReport(FPDF):
         self.ln(5)
 
         self.set_font("Helvetica", "", 11)
-        self.multi_cell(
+        self.safe_multi_cell(
             0,
             6,
             "This report identifies high-quality Growth at a Reasonable Price (GARP) opportunities. "
             "Our screening process combines rigorous quantitative filters with AI-powered fundamental analysis. "
             "The selected stocks demonstrate strong return on capital, reasonable valuations, and positive momentum.",
+            max_length=500,
         )
         self.ln(10)
 
@@ -76,11 +167,15 @@ class ResearchReport(FPDF):
             self.set_font("Helvetica", "B", 12)
             self.cell(30, 8, stock["Symbol"], 0, 0)
             self.set_font("Helvetica", "", 12)
-            self.cell(0, 8, f"- {stock['Name']}", 0, 1)
+            name_clean = self.strip_emojis(str(stock.get("Name", "N/A")))
+            self.cell(0, 8, f"- {name_clean}", 0, 1)
 
             self.set_font("Helvetica", "I", 10)
-            summary = stock.get('Investment Summary', 'No summary available')
-            self.multi_cell(0, 6, f"Summary: {str(summary)[:200]}...")
+            summary = stock.get("Investment Summary", "No summary available")
+            summary_clean = self.strip_emojis(str(summary))
+            self.safe_multi_cell(
+                0, 6, f"Summary: {summary_clean[:200]}...", max_length=300
+            )
             self.ln(5)
 
     def portfolio_allocation(self, portfolio_df):
@@ -90,11 +185,12 @@ class ResearchReport(FPDF):
         self.ln(5)
 
         self.set_font("Helvetica", "", 11)
-        self.multi_cell(
+        self.safe_multi_cell(
             0,
             6,
             "The following portfolio is optimized to maximize the Sharpe Ratio, balancing expected returns against volatility. "
             "Allocation is weighted towards our highest conviction ideas.",
+            max_length=500,
         )
         self.ln(10)
 
@@ -120,7 +216,8 @@ class ResearchReport(FPDF):
             self.cell(30, 8, row["Symbol"], 1, 0, "C")
             self.cell(30, 8, f"{weight:.2f}%", 1, 0, "C")
             self.cell(40, 8, f"${allocation_amt:,.2f}", 1, 0, "C")
-            self.cell(60, 8, row["Sector"], 1, 1, "C")
+            sector_clean = self.strip_emojis(str(row.get("Sector", "N/A")))
+            self.cell(60, 8, sector_clean, 1, 1, "C")
 
         self.ln(10)
 
@@ -129,19 +226,14 @@ class ResearchReport(FPDF):
 
         # Header Section
         self.set_font("Helvetica", "B", 20)
-        self.cell(120, 10, f"{stock_data['Symbol']} - {stock_data['Name']}", 0, 0)
+        symbol = stock_data.get("Symbol", "N/A")
+        name = self.strip_emojis(str(stock_data.get("Name", "N/A")))
+        self.cell(120, 10, f"{symbol} - {name}", 0, 0)
 
         # Rating Badge
-        action = stock_data["Action"]
+        action = stock_data.get("Action", "N/A")
         # Strip emojis for PDF compatibility
-        action_clean = (
-            action.replace("🟢", "")
-            .replace("🟡", "")
-            .replace("🔵", "")
-            .replace("⚪", "")
-            .replace("🔴", "")
-            .strip()
-        )
+        action_clean = self.strip_emojis(action)
 
         if "BUY" in action:
             self.set_text_color(0, 150, 0)  # Green
@@ -156,10 +248,12 @@ class ResearchReport(FPDF):
 
         self.ln(5)
         self.set_font("Helvetica", "", 10)
+        sector = self.strip_emojis(str(stock_data.get("Sector", "N/A")))
+        price = stock_data.get("Current Price", 0)
         self.cell(
             0,
             6,
-            f"Sector: {stock_data['Sector']} | Price: ${stock_data.get('Current Price', 0):.2f}",
+            f"Sector: {sector} | Price: ${price:.2f}",
             0,
             1,
         )
@@ -227,8 +321,58 @@ class ResearchReport(FPDF):
         self.set_font("Helvetica", "B", 12)
         self.cell(0, 8, "Investment Summary", 0, 1)
         self.set_font("Helvetica", "", 11)
-        self.multi_cell(0, 6, str(stock_data.get("Investment Summary", "No summary available.")))
+        summary_text = stock_data.get("Investment Summary", "No summary available.")
+        if summary_text:
+            self.safe_multi_cell(0, 6, summary_text, max_length=800)
         self.ln(10)
+
+        # Enhanced Advice Fields (if available)
+        if stock_data.get("Action_Rationale"):
+            self.set_font("Helvetica", "B", 10)
+            self.cell(0, 6, "Action Rationale:", 0, 1)
+            self.set_font("Helvetica", "", 9)
+            self.safe_multi_cell(
+                0, 5, stock_data.get("Action_Rationale", ""), max_length=600
+            )
+            self.ln(5)
+
+        if stock_data.get("Investment_Thesis"):
+            self.set_font("Helvetica", "B", 10)
+            self.cell(0, 6, "Investment Thesis:", 0, 1)
+            self.set_font("Helvetica", "", 9)
+            self.safe_multi_cell(
+                0, 5, stock_data.get("Investment_Thesis", ""), max_length=600
+            )
+            self.ln(5)
+
+        if stock_data.get("Entry_Approach"):
+            self.set_font("Helvetica", "B", 10)
+            self.cell(0, 6, "Entry Strategy:", 0, 1)
+            self.set_font("Helvetica", "", 9)
+            entry_approach = stock_data.get("Entry_Approach", "N/A")
+            target_price = stock_data.get("Target_Entry_Price", 0)
+            stop_loss = stock_data.get("Stop_Loss_Price", 0)
+
+            # Format entry info safely
+            try:
+                entry_info = (
+                    f"Approach: {entry_approach} | "
+                    f"Target Price: ${target_price:.2f} | "
+                    f"Stop Loss: ${stop_loss:.2f}"
+                )
+            except (ValueError, TypeError):
+                entry_info = f"Approach: {entry_approach}"
+
+            self.safe_multi_cell(0, 5, entry_info, max_length=200)
+
+            if stock_data.get("Entry_Rationale"):
+                self.safe_multi_cell(
+                    0,
+                    5,
+                    f"Rationale: {stock_data.get('Entry_Rationale', '')}",
+                    max_length=500,
+                )
+            self.ln(5)
 
         # Risk Factors
         if stock_data.get("Risk Warnings") and stock_data["Risk Warnings"] != "None":
@@ -241,8 +385,9 @@ class ResearchReport(FPDF):
             risks = stock_data["Risk Warnings"].split("; ")
             for risk in risks:
                 # Strip emojis for PDF compatibility
-                risk_clean = risk.replace("⚠️", "").replace("❗", "").strip()
-                self.cell(0, 6, f"- {risk_clean}", 0, 1)
+                risk_clean = self.strip_emojis(risk)
+                if risk_clean:  # Only print if there's content after stripping
+                    self.cell(0, 6, f"- {risk_clean}", 0, 1)
 
             self.set_text_color(0, 0, 0)  # Reset
         self.ln(10)

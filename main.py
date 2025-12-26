@@ -1937,6 +1937,392 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
     return final_score, reasons
 
 
+def calculate_comprehensive_risk_score(stock_data: dict, ticker_info: dict) -> dict:
+    """
+    Calculate a 0-100 risk score (higher = riskier).
+    Combines financial, valuation, technical, and sentiment risk.
+    """
+    risk_score = 0
+    risk_factors = []
+
+    # Financial Risk (40% weight)
+    financial_risk = 0
+    de_ratio = stock_data.get("D/E", 0) or 0
+    if de_ratio > 100:
+        financial_risk += 30
+        risk_factors.append("Very high leverage")
+    elif de_ratio > 50:
+        financial_risk += 15
+        risk_factors.append("High leverage")
+
+    interest_coverage = stock_data.get("Interest Coverage")
+    if interest_coverage and interest_coverage < 2:
+        financial_risk += 25
+        risk_factors.append("Weak interest coverage")
+    elif interest_coverage and interest_coverage < 3:
+        financial_risk += 10
+        risk_factors.append("Moderate interest coverage")
+
+    distress_risk = stock_data.get("Financial Distress Risk", "")
+    if "High" in distress_risk:
+        financial_risk += 20
+        risk_factors.append("High financial distress risk")
+
+    financial_risk = min(100, financial_risk)
+    risk_score += financial_risk * 0.4
+
+    # Valuation Risk (25% weight)
+    valuation_risk = 0
+    pe = stock_data.get("P/E", 0) or 0
+    peg = stock_data.get("PEG Ratio", 999) or 999
+    pfcf = stock_data.get("P/FCF", 100) or 100
+
+    if pe > 40 and peg > 2.5:
+        valuation_risk += 30
+        risk_factors.append("Expensive valuation")
+    elif pe > 30:
+        valuation_risk += 15
+
+    if pfcf > 50:
+        valuation_risk += 20
+        risk_factors.append("Very high P/FCF")
+
+    valuation_risk = min(100, valuation_risk)
+    risk_score += valuation_risk * 0.25
+
+    # Technical Risk (20% weight)
+    technical_risk = 0
+    price_trend = stock_data.get("Price Trend")
+    rsi = stock_data.get("RSI", 50) or 50
+
+    if price_trend == "Downtrend":
+        technical_risk += 25
+        risk_factors.append("Downtrend")
+
+    if rsi > 75:
+        technical_risk += 15
+        risk_factors.append("Overbought")
+
+    technical_risk = min(100, technical_risk)
+    risk_score += technical_risk * 0.20
+
+    # Sentiment Risk (15% weight)
+    sentiment_risk = 0
+    analyst_momentum = stock_data.get("Analyst Momentum", "")
+    short_pct = stock_data.get("Short % of Float", 0) or 0
+
+    if analyst_momentum == "Strong Negative":
+        sentiment_risk += 25
+        risk_factors.append("Negative analyst momentum")
+
+    if short_pct and short_pct > 20:
+        sentiment_risk += 20
+        risk_factors.append("High short interest")
+
+    sentiment_risk = min(100, sentiment_risk)
+    risk_score += sentiment_risk * 0.15
+
+    # Classify risk level
+    if risk_score < 30:
+        risk_level = "LOW"
+    elif risk_score < 50:
+        risk_level = "MODERATE"
+    elif risk_score < 70:
+        risk_level = "HIGH"
+    else:
+        risk_level = "VERY HIGH"
+
+    return {
+        "risk_score": round(risk_score, 1),
+        "risk_level": risk_level,
+        "financial_risk": financial_risk,
+        "valuation_risk": valuation_risk,
+        "technical_risk": technical_risk,
+        "sentiment_risk": sentiment_risk,
+        "risk_factors": risk_factors,
+    }
+
+
+def generate_entry_strategy(stock_data: dict) -> dict:
+    """
+    Generate specific entry strategy with price targets based on conviction and technicals.
+    """
+    current_price = stock_data.get("Current Price")
+    if not current_price or current_price <= 0:
+        return {
+            "entry_approach": "UNKNOWN",
+            "target_entry_price": None,
+            "stop_loss_price": None,
+            "timeline": "UNKNOWN",
+            "rationale": "Price data unavailable",
+        }
+
+    rsi = stock_data.get("RSI", 50) or 50
+    conviction = stock_data.get("Conviction Score", 0)
+    dcf_upside = stock_data.get("DCF Upside (%)", 0) or 0
+
+    # High conviction + Oversold = Aggressive entry
+    if conviction >= 70 and rsi < 35:
+        return {
+            "entry_approach": "AGGRESSIVE",
+            "target_entry_price": round(current_price * 0.98, 2),
+            "stop_loss_price": round(current_price * 0.92, 2),
+            "timeline": "IMMEDIATE",
+            "rationale": (
+                "High conviction + Oversold = Strong buy opportunity. "
+                "Enter now or on any minor weakness."
+            ),
+        }
+
+    # High conviction + Overbought = Wait for pullback
+    elif conviction >= 70 and rsi > 65:
+        pullback_target = current_price * 0.95
+        return {
+            "entry_approach": "WAIT_FOR_PULLBACK",
+            "target_entry_price": round(pullback_target, 2),
+            "stop_loss_price": round(pullback_target * 0.92, 2),
+            "timeline": "1-2 WEEKS",
+            "rationale": (
+                f"High conviction but overbought. "
+                f"Wait for pullback to ${pullback_target:.2f} for better entry."
+            ),
+        }
+
+    # Medium conviction + Good value = Dollar cost average
+    elif conviction >= 55 and dcf_upside > 15:
+        return {
+            "entry_approach": "DOLLAR_COST_AVERAGE",
+            "target_entry_price": round(current_price, 2),
+            "stop_loss_price": round(current_price * 0.90, 2),
+            "timeline": "2-4 WEEKS",
+            "rationale": (
+                "Good value but medium conviction. "
+                "DCA: Buy 50% now, 50% if price drops 5% or fundamentals improve."
+            ),
+        }
+
+    # Medium conviction + Neutral technicals = Standard entry
+    elif conviction >= 55:
+        return {
+            "entry_approach": "STANDARD",
+            "target_entry_price": round(current_price, 2),
+            "stop_loss_price": round(current_price * 0.92, 2),
+            "timeline": "1 WEEK",
+            "rationale": "Moderate conviction. Enter at current levels with stop loss.",
+        }
+
+    # Low conviction = Watchlist
+    else:
+        return {
+            "entry_approach": "WATCHLIST",
+            "target_entry_price": round(current_price * 0.93, 2),
+            "stop_loss_price": None,
+            "timeline": "ONGOING",
+            "rationale": (
+                f"Low conviction. Monitor for better entry price "
+                f"(${current_price * 0.93:.2f}) or improving fundamentals."
+            ),
+        }
+
+
+def generate_exit_strategy(stock_data: dict) -> dict:
+    """
+    Generate exit strategy with profit targets and stop losses.
+    """
+    current_price = stock_data.get("Current Price")
+    if not current_price or current_price <= 0:
+        return {"profit_targets": [], "stop_loss": None, "trailing_stop": None}
+
+    dcf_fair_value = stock_data.get("DCF Fair Value")
+    dcf_upside = stock_data.get("DCF Upside (%)", 0) or 0
+    target_price = stock_data.get("Target Mean Price")
+    conviction = stock_data.get("Conviction Score", 0)
+    beta = stock_data.get("Beta", 1.0) or 1.0
+
+    strategy = {"profit_targets": [], "stop_loss": None, "trailing_stop": None}
+
+    # Profit targets from different valuation methods
+    if dcf_fair_value and dcf_fair_value > current_price:
+        strategy["profit_targets"].append(
+            {
+                "price": round(dcf_fair_value, 2),
+                "upside_pct": round(dcf_upside, 1),
+                "rationale": "DCF Fair Value",
+                "priority": "HIGH" if dcf_upside > 20 else "MEDIUM",
+            }
+        )
+
+    if target_price and target_price > current_price:
+        target_upside = ((target_price - current_price) / current_price) * 100
+        strategy["profit_targets"].append(
+            {
+                "price": round(target_price, 2),
+                "upside_pct": round(target_upside, 1),
+                "rationale": "Analyst Target Price",
+                "priority": "MEDIUM",
+            }
+        )
+
+    # Stop loss based on volatility and conviction
+    stop_loss_pct = 8 + (beta - 1.0) * 5  # Higher beta = wider stop
+    if conviction < 50:
+        stop_loss_pct = 6  # Tighter stop for low conviction
+    elif conviction >= 75:
+        stop_loss_pct = 10  # Wider stop for high conviction
+
+    strategy["stop_loss"] = round(current_price * (1 - stop_loss_pct / 100), 2)
+
+    # Trailing stop for high conviction positions
+    if conviction >= 70:
+        strategy["trailing_stop"] = "10% trailing stop after 15% gain"
+
+    return strategy
+
+
+def calculate_position_size(
+    conviction: int, risk_score: float, portfolio_value: float = 100000
+) -> dict:
+    """
+    Calculate recommended position size based on conviction and risk.
+    High conviction + Low risk = Larger position.
+    """
+    # Base position size from conviction
+    if conviction >= 75:
+        base_size_pct = 0.12  # 12%
+    elif conviction >= 60:
+        base_size_pct = 0.08  # 8%
+    elif conviction >= 45:
+        base_size_pct = 0.05  # 5%
+    else:
+        base_size_pct = 0.03  # 3%
+
+    # Adjust for risk
+    if risk_score > 70:  # High risk
+        base_size_pct *= 0.5
+    elif risk_score < 30:  # Low risk
+        base_size_pct *= 1.2
+
+    # Cap at 15%
+    position_size_pct = min(base_size_pct, 0.15)
+    position_value = portfolio_value * position_size_pct
+
+    return {
+        "position_size_pct": round(position_size_pct * 100, 1),
+        "position_value": round(position_value, 2),
+        "rationale": (
+            f"Based on conviction ({conviction}/100) and risk ({risk_score:.0f}/100). "
+            f"Higher conviction + Lower risk = Larger position."
+        ),
+    }
+
+
+def generate_investment_thesis(stock_data: dict) -> str:
+    """
+    Generate narrative investment thesis explaining why to buy/hold/sell.
+    """
+    symbol = stock_data.get("Symbol", "Unknown")
+    name = stock_data.get("Name", symbol)
+    conviction = stock_data.get("Conviction Score", 0)
+    sector = stock_data.get("Sector", "Unknown")
+
+    strengths = []
+    if stock_data.get("ROIC (%)", 0) > 20:
+        strengths.append(f"exceptional ROIC of {stock_data.get('ROIC (%)'):.1f}%")
+    if stock_data.get("P/FCF", 100) < 15:
+        strengths.append(
+            f"attractive valuation with P/FCF of {stock_data.get('P/FCF'):.1f}"
+        )
+    if stock_data.get("3Y Rev CAGR (%)", 0) > 15:
+        strengths.append(
+            f"strong revenue growth of {stock_data.get('3Y Rev CAGR (%)'):.1f}% CAGR"
+        )
+    if stock_data.get("Margin Trend") == "Expanding":
+        strengths.append("expanding profit margins")
+
+    concerns = []
+    if stock_data.get("D/E", 0) > 50:
+        concerns.append("high leverage")
+    if stock_data.get("Price Trend") == "Downtrend":
+        concerns.append("current downtrend")
+    if stock_data.get("Financial Distress Risk", "").startswith("High"):
+        concerns.append("elevated financial distress risk")
+
+    dcf_upside = stock_data.get("DCF Upside (%)", 0) or 0
+
+    thesis = f"{name} ({symbol}) presents a "
+    if conviction >= 70:
+        thesis += "compelling investment opportunity "
+    elif conviction >= 55:
+        thesis += "solid investment opportunity "
+    else:
+        thesis += "moderate investment opportunity "
+
+    thesis += f"in the {sector} sector. "
+
+    if strengths:
+        thesis += f"The company demonstrates {', '.join(strengths)}. "
+
+    if dcf_upside > 20:
+        thesis += f"Valuation analysis suggests {dcf_upside:.0f}% upside potential. "
+
+    if concerns:
+        thesis += f"Key risks include {', '.join(concerns)}. "
+
+    thesis += f"Overall conviction score: {conviction}/100."
+
+    return thesis
+
+
+def extract_key_strengths(stock_data: dict) -> list[str]:
+    """Extract top 3 key strengths."""
+    strengths = []
+
+    if stock_data.get("ROIC (%)", 0) > 20:
+        strengths.append(f"High ROIC ({stock_data.get('ROIC (%)'):.1f}%)")
+    if stock_data.get("P/FCF", 100) < 15:
+        strengths.append(f"Low P/FCF ({stock_data.get('P/FCF'):.1f})")
+    if stock_data.get("3Y Rev CAGR (%)", 0) > 15:
+        strengths.append(
+            f"Strong Growth ({stock_data.get('3Y Rev CAGR (%)'):.1f}% CAGR)"
+        )
+    if stock_data.get("Piotroski Score", 0) >= 8:
+        strengths.append(
+            f"High Quality (Piotroski: {stock_data.get('Piotroski Score')}/9)"
+        )
+    if stock_data.get("Margin Trend") == "Expanding":
+        strengths.append("Expanding Margins")
+
+    return strengths[:3]
+
+
+def extract_key_weaknesses(stock_data: dict) -> list[str]:
+    """Extract top 3 key weaknesses."""
+    weaknesses = []
+
+    if stock_data.get("D/E", 0) > 50:
+        weaknesses.append(f"High Leverage (D/E: {stock_data.get('D/E'):.1f})")
+    if stock_data.get("Financial Distress Risk", "").startswith("High"):
+        weaknesses.append("High Financial Distress Risk")
+    if stock_data.get("Price Trend") == "Downtrend":
+        weaknesses.append("Downtrend")
+    if stock_data.get("PEG Ratio", 999) > 2.5:
+        weaknesses.append(f"High PEG ({stock_data.get('PEG Ratio'):.2f})")
+
+    return weaknesses[:3]
+
+
+def determine_hold_period(stock_data: dict, conviction: int) -> str:
+    """Determine recommended hold period."""
+    dcf_upside = stock_data.get("DCF Upside (%)", 0) or 0
+
+    if conviction >= 70 and dcf_upside > 30:
+        return "LONG_TERM (2+ years) - High conviction compounder"
+    elif conviction >= 55:
+        return "MEDIUM_TERM (6-18 months) - Monitor fundamentals quarterly"
+    else:
+        return "SHORT_TERM (3-6 months) - Reassess regularly"
+
+
 def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
     """
     Generate risk warnings for a stock.
@@ -2045,71 +2431,136 @@ def get_risk_warnings(stock_data: dict, ticker_info: dict) -> list[str]:
     return warnings
 
 
-def classify_action(conviction: int, graham_undervalued: bool, upside: float) -> str:
+def classify_action(conviction: int, graham_undervalued: bool, upside: float) -> dict:
     """
-    Classify stock as BUY NOW, WATCHLIST, or HOLD based on metrics.
+    Classify stock action with detailed rationale for better investment advice.
+    Returns dict with action and rationale.
     """
-    if conviction >= 8 and graham_undervalued:
-        return "🟢 BUY NOW"
-    elif conviction >= 7 or (conviction >= 6 and upside > 10):
-        return "🟡 BUY"
-    elif conviction >= 5:
-        return "🔵 WATCHLIST"
+    dcf_upside = upside  # Using the upside parameter which is typically DCF upside
+
+    if conviction >= 75 and graham_undervalued and dcf_upside > 25:
+        return {
+            "action": "🟢 STRONG BUY",
+            "rationale": (
+                f"Exceptional opportunity: High conviction ({conviction}/100), "
+                f"undervalued by Graham method, {dcf_upside:.0f}% upside. "
+                f"Consider aggressive entry."
+            ),
+        }
+    elif conviction >= 65 and (graham_undervalued or dcf_upside > 15):
+        return {
+            "action": "🟢 BUY",
+            "rationale": (
+                f"Strong buy signal: High conviction ({conviction}/100) with "
+                f"attractive valuation ({dcf_upside:.0f}% upside). "
+                f"Good entry opportunity."
+            ),
+        }
+    elif conviction >= 55:
+        return {
+            "action": "🟡 BUY",
+            "rationale": (
+                f"Moderate conviction ({conviction}/100). "
+                f"Consider smaller position size or dollar-cost averaging."
+            ),
+        }
+    elif conviction >= 45:
+        return {
+            "action": "🔵 WATCHLIST",
+            "rationale": (
+                f"Watchlist candidate ({conviction}/100). "
+                f"Monitor for improving fundamentals or better entry price."
+            ),
+        }
+    elif conviction >= 35:
+        return {
+            "action": "⚪ HOLD (IF OWNED)",
+            "rationale": (
+                f"Low conviction ({conviction}/100). "
+                f"Hold if already owned, but don't add to position."
+            ),
+        }
     else:
-        return "⚪ HOLD"
+        return {
+            "action": "🔴 AVOID",
+            "rationale": (
+                f"Very low conviction ({conviction}/100). "
+                f"Multiple risk factors present. Avoid new positions."
+            ),
+        }
 
 
 def generate_investment_summary(
     stock_data: dict, ticker_info: dict, conviction_score: int, reasons: list
-) -> str:
+) -> dict:
     """
-    Generate a structured investment summary based on metrics (no AI).
-    Returns a formatted string with key signals and action.
+    Generate comprehensive, actionable investment advice.
+    Returns dict with entry/exit strategies, position sizing, and narrative thesis.
     """
     symbol = stock_data.get("Symbol", "Unknown")
+    current_price = stock_data.get("Current Price")
+    conviction = conviction_score
 
-    # Collect bullish and warning signals
-    bullish = [r for r in reasons if "✓" in r]
-    warnings = [r for r in reasons if "⚠️" in r]
+    # Get action classification with rationale
+    graham_undervalued = stock_data.get("Graham Undervalued", False)
+    upside = stock_data.get("Upside (%)", 0) or stock_data.get("DCF Upside (%)", 0) or 0
+    action_data = classify_action(conviction, graham_undervalued, upside)
 
-    # Build summary
-    summary_parts = []
+    # Calculate comprehensive risk score
+    risk_data = calculate_comprehensive_risk_score(stock_data, ticker_info)
 
-    # Action based on conviction
-    if conviction_score >= 70:
-        action = "STRONG BUY"
-    elif conviction_score >= 55:
-        action = "BUY"
-    elif conviction_score >= 40:
-        action = "HOLD"
-    else:
-        action = "WATCH"
+    # Generate entry strategy
+    entry_strategy = generate_entry_strategy(stock_data)
 
-    summary_parts.append(f"[{action}] Conviction: {conviction_score}/100")
+    # Generate exit strategy
+    exit_strategy = generate_exit_strategy(stock_data)
 
-    # Key valuation info
-    dcf_upside = stock_data.get("DCF Upside (%)")
-    graham_undervalued = stock_data.get("Graham Undervalued")
-    if dcf_upside is not None:
-        summary_parts.append(f"DCF Upside: {dcf_upside:.1f}%")
-    if graham_undervalued:
-        summary_parts.append("Graham Undervalued")
+    # Calculate position sizing
+    position_size = calculate_position_size(
+        conviction,
+        risk_data.get("risk_score", 50),
+        portfolio_value=100000,  # Default $100k, can be made configurable
+    )
 
-    # Top bullish signals (max 3)
-    if bullish:
-        top_bullish = bullish[:3]
-        summary_parts.append(
-            f"Bullish: {', '.join(s.replace(' ✓', '') for s in top_bullish)}"
-        )
+    # Generate investment thesis
+    thesis = generate_investment_thesis(stock_data)
 
-    # Top warnings (max 2)
-    if warnings:
-        top_warnings = warnings[:2]
-        summary_parts.append(
-            f"Risks: {', '.join(s.replace(' ⚠️', '') for s in top_warnings)}"
-        )
+    # Extract key strengths and weaknesses
+    strengths = extract_key_strengths(stock_data)
+    weaknesses = extract_key_weaknesses(stock_data)
 
-    return " | ".join(summary_parts)
+    # Determine hold period
+    hold_period = determine_hold_period(stock_data, conviction)
+
+    # Build comprehensive summary dict
+    summary = {
+        "Action": action_data["action"],
+        "Action_Rationale": action_data["rationale"],
+        "Conviction_Score": conviction,
+        "Risk_Score": risk_data.get("risk_score", 50),
+        "Risk_Level": risk_data.get("risk_level", "MODERATE"),
+        "Entry_Approach": entry_strategy.get("entry_approach"),
+        "Target_Entry_Price": entry_strategy.get("target_entry_price"),
+        "Entry_Rationale": entry_strategy.get("rationale"),
+        "Stop_Loss_Price": exit_strategy.get("stop_loss"),
+        "Profit_Targets": exit_strategy.get("profit_targets"),
+        "Recommended_Position_Size_Pct": position_size.get("position_size_pct"),
+        "Hold_Period": hold_period,
+        "Investment_Thesis": thesis,
+        "Key_Strengths": "; ".join(strengths) if strengths else "None",
+        "Key_Weaknesses": "; ".join(weaknesses) if weaknesses else "None",
+    }
+
+    # Also create a formatted string for backward compatibility
+    summary_str = (
+        f"[{action_data['action']}] Conviction: {conviction}/100 | "
+        f"Risk: {risk_data.get('risk_score', 50):.0f}/100 ({risk_data.get('risk_level', 'MODERATE')}) | "
+        f"Entry: {entry_strategy.get('entry_approach')} @ ${entry_strategy.get('target_entry_price', 0):.2f} | "
+        f"Position: {position_size.get('position_size_pct', 0):.1f}%"
+    )
+    summary["Summary_String"] = summary_str
+
+    return summary
 
 
 def backtest_portfolio(tickers, weights) -> None:
@@ -2566,15 +3017,15 @@ def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
         # Get risk warnings
         risks = get_risk_warnings(stock_data, ticker_info)
 
-        # Classify action
-        action = classify_action(
-            conviction,
-            stock_data.get("Graham Undervalued", False),
-            stock_data.get("Upside (%)", 0) or 0,
+        # Get action classification with rationale
+        graham_undervalued = stock_data.get("Graham Undervalued", False)
+        upside = (
+            stock_data.get("Upside (%)", 0) or stock_data.get("DCF Upside (%)", 0) or 0
         )
+        action_data = classify_action(conviction, graham_undervalued, upside)
 
-        # Generate investment summary
-        summary = generate_investment_summary(
+        # Generate comprehensive investment summary (now returns dict)
+        summary_dict = generate_investment_summary(
             stock_data, ticker_info, conviction, conviction_reasons
         )
 
@@ -2582,7 +3033,8 @@ def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
         advice_row = stock_data.copy()
         advice_row.update(
             {
-                "Action": action,
+                "Action": action_data["action"],
+                "Action_Rationale": action_data["rationale"],
                 "Conviction": conviction,
                 "Conviction Reasons": "; ".join(conviction_reasons),
                 "Risk Warnings": "; ".join(
@@ -2590,7 +3042,23 @@ def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
                 )
                 if risks
                 else "None",
-                "Investment Summary": summary,
+                # Enhanced advice fields
+                "Risk_Score": summary_dict.get("Risk_Score", 50),
+                "Risk_Level": summary_dict.get("Risk_Level", "MODERATE"),
+                "Entry_Approach": summary_dict.get("Entry_Approach"),
+                "Target_Entry_Price": summary_dict.get("Target_Entry_Price"),
+                "Entry_Rationale": summary_dict.get("Entry_Rationale"),
+                "Stop_Loss_Price": summary_dict.get("Stop_Loss_Price"),
+                "Profit_Targets": str(summary_dict.get("Profit_Targets", [])),
+                "Recommended_Position_Size_Pct": summary_dict.get(
+                    "Recommended_Position_Size_Pct"
+                ),
+                "Hold_Period": summary_dict.get("Hold_Period"),
+                "Investment_Thesis": summary_dict.get("Investment_Thesis"),
+                "Key_Strengths": summary_dict.get("Key_Strengths"),
+                "Key_Weaknesses": summary_dict.get("Key_Weaknesses"),
+                # Backward compatibility - keep summary string
+                "Investment Summary": summary_dict.get("Summary_String", ""),
             }
         )
 
@@ -2598,10 +3066,29 @@ def generate_stock_summaries(passed_df: pd.DataFrame) -> pd.DataFrame:
 
     advice_df = pd.DataFrame(advice_data)
 
-    # Display concise summary
-    print("\nRecommendations:")
+    # Display enhanced recommendations
+    print("\n" + "=" * 60)
+    print("INVESTMENT RECOMMENDATIONS")
+    print("=" * 60)
     for _, row in advice_df.iterrows():
-        print(f"  {row['Symbol']}: {row['Action']} ({row['Conviction']}/100)")
+        symbol = row["Symbol"]
+        action = row["Action"]
+        conviction = row["Conviction"]
+        risk_score = row.get("Risk_Score", 50)
+        risk_level = row.get("Risk_Level", "MODERATE")
+        entry_approach = row.get("Entry_Approach", "N/A")
+        entry_price = row.get("Target_Entry_Price", 0)
+        position_size = row.get("Recommended_Position_Size_Pct", 0)
+
+        print(f"\n{symbol}: {action}")
+        print(
+            f"  Conviction: {conviction}/100 | Risk: {risk_score:.0f}/100 ({risk_level})"
+        )
+        print(
+            f"  Entry: {entry_approach} @ ${entry_price:.2f} | Position: {position_size:.1f}%"
+        )
+        if row.get("Action_Rationale"):
+            print(f"  Rationale: {row['Action_Rationale']}")
 
     # Export summary (silent)
     advice_df.to_csv("investment_summary.csv", index=False)
