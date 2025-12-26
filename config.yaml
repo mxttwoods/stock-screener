@@ -51,3 +51,78 @@ conviction:
   technical_weight: 15
   sentiment_weight: 10
   risk_penalty_per_flag: 3 # Points deducted per risk warning
+
+# Sector-specific tolerance factors for relative screening
+sector_tolerances:
+  Technology:
+    pe_tolerance: 1.4      # Tech can trade at 40% premium to market
+    ps_tolerance: 1.5      # Revenue multiples higher for growth
+    growth_premium: 1.2    # Higher growth expectations
+    pb_tolerance: 1.3
+  Healthcare:
+    pe_tolerance: 1.3
+    ps_tolerance: 1.4
+    growth_premium: 1.1
+    pb_tolerance: 1.2
+  Financial Services:
+    pe_tolerance: 1.0      # Banks trade at lower multiples
+    ps_tolerance: 0.8
+    growth_premium: 0.9
+    pb_tolerance: 1.0
+  Consumer Cyclical:
+    pe_tolerance: 1.2
+    ps_tolerance: 1.1
+    growth_premium: 1.0
+    pb_tolerance: 1.1
+  Consumer Defensive:
+    pe_tolerance: 1.1
+    ps_tolerance: 1.0
+    growth_premium: 0.9
+    pb_tolerance: 1.0
+  Industrials:
+    pe_tolerance: 1.1
+    ps_tolerance: 1.0
+    growth_premium: 1.0
+    pb_tolerance: 1.1
+  Communication Services:
+    pe_tolerance: 1.3
+    ps_tolerance: 1.3
+    growth_premium: 1.1
+    pb_tolerance: 1.2
+  Real Estate:
+    pe_tolerance: 1.2
+    ps_tolerance: 1.0
+    growth_premium: 0.8
+    pb_tolerance: 0.9
+  default:
+    pe_tolerance: 1.2
+    ps_tolerance: 1.1
+    growth_premium: 1.0
+    pb_tolerance: 1.1
+
+# Liquidity requirements
+liquidity:
+  min_avg_volume: 500000          # Minimum average daily volume
+  min_market_cap_millions: 1000   # Minimum market cap in millions
+
+# Portfolio optimization enhancements
+portfolio:
+  var_confidence: 0.95            # VaR confidence level (95%)
+  var_horizon_days: 20            # VaR time horizon (1 month)
+  transaction_cost_bps: 10        # Estimated round-trip cost in basis points
+  max_correlation: 0.75           # Max pairwise correlation allowed
+  min_weight_pct: 2.0             # Minimum position weight
+  max_weight_pct: 20.0            # Maximum position weight
+
+# Data quality thresholds
+data_quality:
+  min_history_days: 252           # Minimum price history required (1 year)
+  max_data_age_days: 5            # Maximum age for financial data
+  min_analyst_coverage: 3         # Minimum analysts for confidence
+
+# Backtesting configuration
+backtest:
+  walk_forward_windows: 4         # Number of walk-forward periods
+  train_period_months: 12         # Training period for each window
+  test_period_months: 3           # Test period for each window
+  benchmark_symbol: "SPY"         # Benchmark for comparison
