@@ -34,6 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress yfinance 404 errors for optional data (insider purchases, sustainability, etc.)
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -1198,6 +1201,138 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
     if leverage and leverage > leverage_limit:
         score -= 1
         reasons.append(f"High leverage (D/E: {leverage:.1f}) ⚠️")
+
+    # --- NEW: Enhanced yfinance Data Metrics ---
+
+    # Short Interest Analysis
+    short_pct = stock_data.get("Short % of Float")
+    short_signal = stock_data.get("Short Interest Signal")
+    if short_pct and short_pct > 20:
+        score -= 1
+        reasons.append(f"High short interest ({short_pct:.1f}%) ⚠️")
+    elif short_signal == "Short Covering Rally Potential":
+        score += 1
+        reasons.append("Short covering potential ✓")
+
+    # Analyst Momentum (Upgrades/Downgrades)
+    analyst_momentum = stock_data.get("Analyst Momentum")
+    if analyst_momentum == "Strong Positive":
+        score += 2
+        reasons.append("Strong analyst upgrade momentum ✓")
+    elif analyst_momentum == "Positive":
+        score += 1
+        reasons.append("Positive analyst momentum ✓")
+    elif analyst_momentum == "Strong Negative":
+        score -= 2
+        reasons.append("Strong analyst downgrade trend ⚠️")
+    elif analyst_momentum == "Negative":
+        score -= 1
+        reasons.append("Negative analyst momentum ⚠️")
+
+    # Target Price Analysis
+    target_upside = stock_data.get("Target Upside (%)")
+    analyst_agreement = stock_data.get("Analyst Agreement")
+    if target_upside and target_upside > 25 and analyst_agreement == "High":
+        score += 2
+        reasons.append(f"Strong target upside w/ consensus ({target_upside:.1f}%) ✓")
+    elif target_upside and target_upside > 20:
+        score += 1
+        reasons.append(f"Good target upside ({target_upside:.1f}%) ✓")
+    elif target_upside and target_upside < -10:
+        score -= 1
+        reasons.append(f"Below analyst targets ({target_upside:.1f}%) ⚠️")
+
+    # Insider Ownership (Skin in Game)
+    insider_pct = stock_data.get("Insider Ownership (%)")
+    insider_signal = stock_data.get("Insider Signal")
+    if insider_signal == "Very High (Founder-led)":
+        score += 1
+        reasons.append(f"Strong insider alignment ({insider_pct:.1f}%) ✓")
+    elif insider_signal == "Low Skin in Game" and insider_pct is not None:
+        score -= 1
+        reasons.append(f"Low insider ownership ({insider_pct:.1f}%) ⚠️")
+
+    # Recent Insider Purchases
+    insider_purchases = stock_data.get("Recent Insider Purchases", 0) or 0
+    if insider_purchases > 0:
+        score += 1
+        reasons.append(f"Recent insider buying ({insider_purchases:,} shares) ✓")
+
+    # Dividend Quality (for dividend payers)
+    div_consistency = stock_data.get("Dividend Consistency")
+    div_cagr = stock_data.get("Dividend Growth CAGR (%)")
+    if div_consistency == "Excellent (5+ Years Increases)":
+        score += 1
+        reasons.append("Excellent dividend track record ✓")
+    if stock_data.get("Dividend Aristocrat"):
+        score += 1
+        reasons.append("Dividend Aristocrat (25+ years) ✓")
+    if div_cagr and div_cagr > 10:
+        score += 1
+        reasons.append(f"Strong dividend growth ({div_cagr:.1f}% CAGR) ✓")
+
+    # ESG/Governance
+    esg_risk = stock_data.get("ESG Risk Level")
+    gov_score = stock_data.get("Governance Score")
+    if esg_risk in ["Negligible Risk", "Low Risk"]:
+        score += 1
+        reasons.append(f"Low ESG risk ({esg_risk}) ✓")
+    elif esg_risk in ["High Risk", "Severe Risk"]:
+        score -= 1
+        reasons.append(f"High ESG risk ({esg_risk}) ⚠️")
+
+    # Analyst Sentiment Score
+    sentiment_score = stock_data.get("Analyst Sentiment Score")
+    sentiment_label = stock_data.get("Analyst Sentiment")
+    if sentiment_score and sentiment_score >= 1.5:
+        score += 1
+        reasons.append(f"Very bullish analyst sentiment ({sentiment_label}) ✓")
+    elif sentiment_score and sentiment_score <= -0.5:
+        score -= 1
+        reasons.append(f"Bearish analyst sentiment ({sentiment_label}) ⚠️")
+
+    # Options Implied Volatility
+    iv_signal = stock_data.get("IV Signal")
+    put_call_ratio = stock_data.get("Put/Call OI Ratio")
+    if iv_signal == "Very High Volatility Expected":
+        reasons.append("High implied volatility (elevated risk) ⚠️")
+    if put_call_ratio and put_call_ratio > 1.5:
+        score -= 1
+        reasons.append(f"Bearish options positioning (P/C: {put_call_ratio:.2f}) ⚠️")
+    elif put_call_ratio and put_call_ratio < 0.5:
+        score += 1
+        reasons.append(f"Bullish options positioning (P/C: {put_call_ratio:.2f}) ✓")
+
+    # 52-Week Position
+    week_52_signal = stock_data.get("52-Week Position Signal")
+    if week_52_signal == "Near 52-Week High (Momentum)":
+        score += 1
+        reasons.append("Strong momentum (near 52W high) ✓")
+    elif week_52_signal == "Near 52-Week Low (Contrarian)":
+        reasons.append("Contrarian opportunity (near 52W low)")
+
+    # FCF Yield
+    fcf_yield = stock_data.get("FCF Yield (%)")
+    yield_spread = stock_data.get("Yield Spread vs T-Bill")
+    if fcf_yield and fcf_yield > 8:
+        score += 1
+        reasons.append(f"High FCF yield ({fcf_yield:.1f}%) ✓")
+    if yield_spread and yield_spread > 4:
+        score += 1
+        reasons.append(f"Attractive yield spread (+{yield_spread:.1f}% vs T-Bill) ✓")
+
+    # Growth Quality
+    growth_quality_score = stock_data.get("Growth Quality Score")
+    margin_trend = stock_data.get("Margin Trend")
+    if growth_quality_score and growth_quality_score >= 3:
+        score += 2
+        reasons.append("Excellent growth quality (3/3) ✓")
+    elif growth_quality_score and growth_quality_score >= 2:
+        score += 1
+        reasons.append("Good growth quality (2/3) ✓")
+    if margin_trend == "Compressing":
+        score -= 1
+        reasons.append("Margin compression ⚠️")
 
     # Cap score at 1-10
     score = max(1, min(10, score))
@@ -3192,6 +3327,566 @@ def calculate_ttm_metrics(ticker: yf.Ticker) -> dict:
         return {}
 
 
+# =============================================================================
+# NEW YFINANCE DATA METRICS
+# =============================================================================
+
+
+def get_short_interest_metrics(info: dict) -> dict:
+    """
+    Extract short interest metrics from ticker.info.
+    High short interest can indicate contrarian opportunities or high risk.
+    """
+    try:
+        short_percent = info.get("shortPercentOfFloat")
+        short_ratio = info.get("shortRatio")  # Days to cover
+        shares_short = info.get("sharesShort")
+        shares_short_prior = info.get("sharesShortPriorMonth")
+
+        result = {
+            "Short % of Float": round(short_percent * 100, 2) if short_percent else None,
+            "Short Ratio (Days)": round(short_ratio, 2) if short_ratio else None,
+            "Shares Short": shares_short,
+        }
+
+        # Calculate short interest trend
+        if shares_short and shares_short_prior and shares_short_prior > 0:
+            short_change = ((shares_short - shares_short_prior) / shares_short_prior) * 100
+            result["Short Interest Change (%)"] = round(short_change, 2)
+
+            if short_change > 20:
+                result["Short Interest Signal"] = "Increasing Bearish Pressure"
+            elif short_change < -20:
+                result["Short Interest Signal"] = "Short Covering Rally Potential"
+            else:
+                result["Short Interest Signal"] = "Stable"
+        else:
+            result["Short Interest Change (%)"] = None
+            result["Short Interest Signal"] = None
+
+        # Short squeeze potential: High short % + positive momentum
+        if short_percent and short_percent > 0.15:  # >15% of float shorted
+            result["Short Squeeze Risk"] = "High"
+        elif short_percent and short_percent > 0.10:
+            result["Short Squeeze Risk"] = "Moderate"
+        else:
+            result["Short Squeeze Risk"] = "Low"
+
+        return result
+
+    except Exception as e:
+        logger.debug(f"Short interest metrics failed: {str(e)}")
+        return {}
+
+
+def get_analyst_upgrades_downgrades(ticker: yf.Ticker) -> dict:
+    """
+    Analyze recent analyst upgrades/downgrades for sentiment momentum.
+    Early warning system for deteriorating/improving fundamentals.
+    """
+    try:
+        upgrades = ticker.upgrades_downgrades
+        if upgrades is None or upgrades.empty:
+            return {
+                "Recent Upgrades (3M)": None,
+                "Recent Downgrades (3M)": None,
+                "Analyst Momentum": None,
+            }
+
+        # Filter to last 3 months
+        three_months_ago = pd.Timestamp.now() - pd.DateOffset(months=3)
+        if isinstance(upgrades.index, pd.DatetimeIndex):
+            recent = upgrades[upgrades.index >= three_months_ago]
+        else:
+            recent = upgrades  # Use all if index isn't datetime
+
+        if recent.empty:
+            return {
+                "Recent Upgrades (3M)": 0,
+                "Recent Downgrades (3M)": 0,
+                "Analyst Momentum": "No Recent Activity",
+            }
+
+        # Count upgrades vs downgrades
+        upgrades_count = 0
+        downgrades_count = 0
+
+        for _, row in recent.iterrows():
+            action = str(row.get("Action", "")).lower()
+            if "upgrade" in action or "initiated" in action:
+                upgrades_count += 1
+            elif "downgrade" in action or "lowered" in action:
+                downgrades_count += 1
+
+        # Determine momentum
+        net_momentum = upgrades_count - downgrades_count
+        if net_momentum >= 3:
+            momentum = "Strong Positive"
+        elif net_momentum >= 1:
+            momentum = "Positive"
+        elif net_momentum <= -3:
+            momentum = "Strong Negative"
+        elif net_momentum <= -1:
+            momentum = "Negative"
+        else:
+            momentum = "Neutral"
+
+        return {
+            "Recent Upgrades (3M)": upgrades_count,
+            "Recent Downgrades (3M)": downgrades_count,
+            "Net Analyst Actions": net_momentum,
+            "Analyst Momentum": momentum,
+        }
+
+    except Exception as e:
+        logger.debug(f"Analyst upgrades/downgrades failed: {str(e)}")
+        return {}
+
+
+def get_target_price_analysis(info: dict) -> dict:
+    """
+    Analyze analyst price targets for upside potential.
+    """
+    try:
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        target_mean = info.get("targetMeanPrice")
+        target_high = info.get("targetHighPrice")
+        target_low = info.get("targetLowPrice")
+        num_analysts = info.get("numberOfAnalystOpinions")
+
+        result = {
+            "Target Mean Price": target_mean,
+            "Target High Price": target_high,
+            "Target Low Price": target_low,
+            "Analyst Coverage": num_analysts,
+        }
+
+        if current_price and target_mean:
+            upside = ((target_mean - current_price) / current_price) * 100
+            result["Target Upside (%)"] = round(upside, 2)
+
+            if upside > 30:
+                result["Target Signal"] = "Strong Upside"
+            elif upside > 15:
+                result["Target Signal"] = "Moderate Upside"
+            elif upside > 0:
+                result["Target Signal"] = "Slight Upside"
+            elif upside > -15:
+                result["Target Signal"] = "Near Target"
+            else:
+                result["Target Signal"] = "Overvalued vs Targets"
+        else:
+            result["Target Upside (%)"] = None
+            result["Target Signal"] = None
+
+        # Target range spread (analyst agreement)
+        if target_high and target_low and target_mean:
+            spread = ((target_high - target_low) / target_mean) * 100
+            result["Target Spread (%)"] = round(spread, 2)
+            if spread < 30:
+                result["Analyst Agreement"] = "High"
+            elif spread < 60:
+                result["Analyst Agreement"] = "Moderate"
+            else:
+                result["Analyst Agreement"] = "Low (Wide Range)"
+
+        return result
+
+    except Exception as e:
+        logger.debug(f"Target price analysis failed: {str(e)}")
+        return {}
+
+
+def get_insider_ownership_metrics(info: dict, ticker: yf.Ticker) -> dict:
+    """
+    Analyze insider and institutional ownership for 'skin in game' assessment.
+    """
+    try:
+        insider_pct = info.get("heldPercentInsiders")
+        inst_pct = info.get("heldPercentInstitutions")
+
+        result = {
+            "Insider Ownership (%)": round(insider_pct * 100, 2) if insider_pct else None,
+            "Institutional Ownership (%)": round(inst_pct * 100, 2) if inst_pct else None,
+        }
+
+        # Insider ownership interpretation
+        if insider_pct:
+            if insider_pct > 0.30:
+                result["Insider Signal"] = "Very High (Founder-led)"
+            elif insider_pct > 0.10:
+                result["Insider Signal"] = "Good Alignment"
+            elif insider_pct > 0.03:
+                result["Insider Signal"] = "Moderate"
+            else:
+                result["Insider Signal"] = "Low Skin in Game"
+        else:
+            result["Insider Signal"] = None
+
+        # Institutional ownership interpretation
+        if inst_pct:
+            if inst_pct > 0.90:
+                result["Institutional Signal"] = "Very High (Crowded)"
+            elif inst_pct > 0.70:
+                result["Institutional Signal"] = "High Institutional Interest"
+            elif inst_pct > 0.40:
+                result["Institutional Signal"] = "Moderate"
+            else:
+                result["Institutional Signal"] = "Under-owned by Institutions"
+
+        # Check for recent insider purchases
+        try:
+            insider_purchases = ticker.insider_purchases
+            if insider_purchases is not None and not insider_purchases.empty:
+                total_purchases = insider_purchases.get("Shares", pd.Series()).sum()
+                result["Recent Insider Purchases"] = int(total_purchases) if total_purchases > 0 else 0
+            else:
+                result["Recent Insider Purchases"] = 0
+        except Exception:
+            result["Recent Insider Purchases"] = None
+
+        return result
+
+    except Exception as e:
+        logger.debug(f"Insider ownership metrics failed: {str(e)}")
+        return {}
+
+
+def get_dividend_growth_analysis(ticker: yf.Ticker, info: dict) -> dict:
+    """
+    Analyze dividend history for quality and growth.
+    """
+    try:
+        dividends = ticker.dividends
+        if dividends is None or dividends.empty:
+            return {
+                "Dividend Growth CAGR (%)": None,
+                "Dividend Consistency": "No Dividends",
+                "Years of Dividends": 0,
+            }
+
+        # Get annual dividend totals
+        annual_divs = dividends.resample("YE").sum()
+        annual_divs = annual_divs[annual_divs > 0]  # Remove years with no dividends
+
+        if len(annual_divs) < 2:
+            current_yield = info.get("dividendYield")
+            return {
+                "Dividend Growth CAGR (%)": None,
+                "Dividend Consistency": "New Dividend Payer",
+                "Years of Dividends": len(annual_divs),
+                "Current Yield (%)": round(current_yield * 100, 2) if current_yield else None,
+            }
+
+        years = len(annual_divs)
+        first_div = annual_divs.iloc[0]
+        last_div = annual_divs.iloc[-1]
+
+        # Calculate CAGR
+        if first_div > 0 and years > 1:
+            cagr = ((last_div / first_div) ** (1 / (years - 1)) - 1) * 100
+        else:
+            cagr = None
+
+        # Check consistency (how many years had increases)
+        increases = 0
+        decreases = 0
+        for i in range(1, len(annual_divs)):
+            if annual_divs.iloc[i] > annual_divs.iloc[i - 1]:
+                increases += 1
+            elif annual_divs.iloc[i] < annual_divs.iloc[i - 1]:
+                decreases += 1
+
+        # Determine consistency rating
+        if decreases == 0 and increases >= 5:
+            consistency = "Excellent (5+ Years Increases)"
+        elif decreases == 0 and increases >= 3:
+            consistency = "Good (Consistent Growth)"
+        elif decreases <= 1:
+            consistency = "Fair (Mostly Stable)"
+        else:
+            consistency = "Variable"
+
+        # Dividend aristocrat check (25+ years of increases)
+        is_aristocrat = years >= 25 and decreases == 0
+
+        current_yield = info.get("dividendYield")
+        payout_ratio = info.get("payoutRatio")
+
+        return {
+            "Dividend Growth CAGR (%)": round(cagr, 2) if cagr else None,
+            "Dividend Consistency": consistency,
+            "Years of Dividends": years,
+            "Consecutive Increases": increases,
+            "Dividend Aristocrat": is_aristocrat,
+            "Current Yield (%)": round(current_yield * 100, 2) if current_yield else None,
+            "Payout Ratio (%)": round(payout_ratio * 100, 2) if payout_ratio else None,
+        }
+
+    except Exception as e:
+        logger.debug(f"Dividend growth analysis failed: {str(e)}")
+        return {}
+
+
+def get_recommendations_sentiment(ticker: yf.Ticker) -> dict:
+    """
+    Calculate aggregate analyst sentiment score from recommendations summary.
+    """
+    try:
+        summary = ticker.recommendations_summary
+        if summary is None or summary.empty:
+            return {
+                "Analyst Sentiment Score": None,
+                "Analyst Sentiment": None,
+                "Strong Buy %": None,
+            }
+
+        # Extract counts (handle both Series and DataFrame)
+        if isinstance(summary, pd.DataFrame):
+            # Take the most recent period
+            summary = summary.iloc[0] if len(summary) > 0 else summary
+
+        strong_buy = summary.get("strongBuy", 0) or 0
+        buy = summary.get("buy", 0) or 0
+        hold = summary.get("hold", 0) or 0
+        sell = summary.get("sell", 0) or 0
+        strong_sell = summary.get("strongSell", 0) or 0
+
+        total = strong_buy + buy + hold + sell + strong_sell
+
+        if total == 0:
+            return {
+                "Analyst Sentiment Score": None,
+                "Analyst Sentiment": "No Coverage",
+                "Strong Buy %": None,
+            }
+
+        # Weighted sentiment score: -2 (Strong Sell) to +2 (Strong Buy)
+        sentiment_score = (
+            (strong_buy * 2 + buy * 1 + hold * 0 - sell * 1 - strong_sell * 2) / total
+        )
+
+        # Calculate percentages
+        strong_buy_pct = (strong_buy / total) * 100
+        buy_pct = ((strong_buy + buy) / total) * 100
+
+        # Interpret sentiment
+        if sentiment_score >= 1.5:
+            sentiment = "Very Bullish"
+        elif sentiment_score >= 0.8:
+            sentiment = "Bullish"
+        elif sentiment_score >= 0.3:
+            sentiment = "Moderately Bullish"
+        elif sentiment_score >= -0.3:
+            sentiment = "Neutral"
+        elif sentiment_score >= -0.8:
+            sentiment = "Moderately Bearish"
+        else:
+            sentiment = "Bearish"
+
+        return {
+            "Analyst Sentiment Score": round(sentiment_score, 2),
+            "Analyst Sentiment": sentiment,
+            "Strong Buy %": round(strong_buy_pct, 1),
+            "Buy or Better %": round(buy_pct, 1),
+            "Total Analyst Count": int(total),
+        }
+
+    except Exception as e:
+        logger.debug(f"Recommendations sentiment failed: {str(e)}")
+        return {}
+
+
+def get_esg_scores(ticker: yf.Ticker) -> dict:
+    """
+    Extract ESG (Environmental, Social, Governance) sustainability scores.
+    """
+    try:
+        sustainability = ticker.sustainability
+        if sustainability is None or sustainability.empty:
+            return {
+                "ESG Total Score": None,
+                "ESG Risk Level": None,
+                "Governance Score": None,
+            }
+
+        # Extract scores (sustainability is typically a DataFrame with index as metric names)
+        def get_score(key):
+            if key in sustainability.index:
+                val = sustainability.loc[key].iloc[0] if isinstance(sustainability.loc[key], pd.Series) else sustainability.loc[key]
+                return float(val) if pd.notna(val) else None
+            return None
+
+        total_esg = get_score("totalEsg")
+        env_score = get_score("environmentScore")
+        social_score = get_score("socialScore")
+        gov_score = get_score("governanceScore")
+        esg_perf = get_score("esgPerformance")
+
+        # ESG risk interpretation (lower is better for risk scores)
+        risk_level = None
+        if total_esg is not None:
+            if total_esg < 15:
+                risk_level = "Negligible Risk"
+            elif total_esg < 25:
+                risk_level = "Low Risk"
+            elif total_esg < 35:
+                risk_level = "Medium Risk"
+            elif total_esg < 45:
+                risk_level = "High Risk"
+            else:
+                risk_level = "Severe Risk"
+
+        return {
+            "ESG Total Score": round(total_esg, 1) if total_esg else None,
+            "ESG Risk Level": risk_level,
+            "Environmental Score": round(env_score, 1) if env_score else None,
+            "Social Score": round(social_score, 1) if social_score else None,
+            "Governance Score": round(gov_score, 1) if gov_score else None,
+        }
+
+    except Exception as e:
+        logger.debug(f"ESG scores failed: {str(e)}")
+        return {}
+
+
+def get_options_implied_volatility(ticker: yf.Ticker, info: dict) -> dict:
+    """
+    Extract implied volatility from options chain for forward-looking volatility expectations.
+    Uses ATM options near 30 days expiry.
+    """
+    try:
+        # Get available expiration dates
+        expirations = ticker.options
+        if not expirations:
+            return {
+                "Implied Volatility (%)": None,
+                "IV Signal": None,
+            }
+
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if not current_price:
+            return {"Implied Volatility (%)": None, "IV Signal": None}
+
+        # Find expiration closest to 30 days
+        today = pd.Timestamp.now()
+        target_date = today + pd.DateOffset(days=30)
+
+        best_expiry = None
+        best_diff = float("inf")
+        for exp in expirations:
+            exp_date = pd.Timestamp(exp)
+            diff = abs((exp_date - target_date).days)
+            if diff < best_diff:
+                best_diff = diff
+                best_expiry = exp
+
+        if not best_expiry or best_diff > 45:  # No expiry within 45 days
+            return {"Implied Volatility (%)": None, "IV Signal": None}
+
+        # Get option chain
+        chain = ticker.option_chain(best_expiry)
+        calls = chain.calls
+        puts = chain.puts
+
+        if calls.empty and puts.empty:
+            return {"Implied Volatility (%)": None, "IV Signal": None}
+
+        # Find ATM options (closest to current price)
+        def find_atm_iv(options_df):
+            if options_df.empty or "strike" not in options_df.columns:
+                return None
+            options_df = options_df.copy()
+            options_df["distance"] = abs(options_df["strike"] - current_price)
+            atm = options_df.nsmallest(3, "distance")  # Take 3 closest
+            if "impliedVolatility" in atm.columns:
+                ivs = atm["impliedVolatility"].dropna()
+                return ivs.mean() if len(ivs) > 0 else None
+            return None
+
+        call_iv = find_atm_iv(calls)
+        put_iv = find_atm_iv(puts)
+
+        # Average call and put IV
+        ivs = [iv for iv in [call_iv, put_iv] if iv is not None]
+        if not ivs:
+            return {"Implied Volatility (%)": None, "IV Signal": None}
+
+        avg_iv = sum(ivs) / len(ivs) * 100  # Convert to percentage
+
+        # Put/Call ratio for sentiment
+        put_call_ratio = None
+        if not puts.empty and not calls.empty:
+            put_oi = puts["openInterest"].sum() if "openInterest" in puts.columns else 0
+            call_oi = calls["openInterest"].sum() if "openInterest" in calls.columns else 0
+            if call_oi > 0:
+                put_call_ratio = put_oi / call_oi
+
+        # IV interpretation
+        if avg_iv > 60:
+            iv_signal = "Very High Volatility Expected"
+        elif avg_iv > 40:
+            iv_signal = "High Volatility Expected"
+        elif avg_iv > 25:
+            iv_signal = "Moderate Volatility"
+        else:
+            iv_signal = "Low Volatility Expected"
+
+        return {
+            "Implied Volatility (%)": round(avg_iv, 1),
+            "IV Signal": iv_signal,
+            "Put/Call OI Ratio": round(put_call_ratio, 2) if put_call_ratio else None,
+            "Options Expiry Used": best_expiry,
+        }
+
+    except Exception as e:
+        logger.debug(f"Options IV analysis failed: {str(e)}")
+        return {}
+
+
+def get_52_week_position(info: dict) -> dict:
+    """
+    Analyze stock's position relative to 52-week high/low.
+    """
+    try:
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        high_52w = info.get("fiftyTwoWeekHigh")
+        low_52w = info.get("fiftyTwoWeekLow")
+
+        if not all([current_price, high_52w, low_52w]):
+            return {}
+
+        # Distance from 52-week high (drawdown)
+        drawdown = ((high_52w - current_price) / high_52w) * 100
+
+        # Position in 52-week range (0% = at low, 100% = at high)
+        range_position = ((current_price - low_52w) / (high_52w - low_52w)) * 100
+
+        # Interpretation
+        if range_position > 90:
+            position_signal = "Near 52-Week High (Momentum)"
+        elif range_position > 70:
+            position_signal = "Upper Range (Strong)"
+        elif range_position > 30:
+            position_signal = "Middle Range"
+        elif range_position > 10:
+            position_signal = "Lower Range (Potential Value)"
+        else:
+            position_signal = "Near 52-Week Low (Contrarian)"
+
+        return {
+            "52-Week Drawdown (%)": round(drawdown, 2),
+            "52-Week Range Position (%)": round(range_position, 1),
+            "52-Week Position Signal": position_signal,
+            "52-Week High": high_52w,
+            "52-Week Low": low_52w,
+        }
+
+    except Exception as e:
+        logger.debug(f"52-week position analysis failed: {str(e)}")
+        return {}
+
+
 def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     """
     Stage 2: Deep financial analysis on Stage 1 candidates.
@@ -3436,6 +4131,19 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             # Fetch news data (sentiment analysis removed)
             news_sentiment_data = get_news_data(symbol, ticker)
 
+            # --- NEW: Enhanced yfinance Data Metrics ---
+            short_interest = get_short_interest_metrics(info)
+            analyst_upgrades = get_analyst_upgrades_downgrades(ticker)
+            target_analysis = get_target_price_analysis(info)
+            ownership_metrics = get_insider_ownership_metrics(info, ticker)
+            dividend_growth = get_dividend_growth_analysis(ticker, info)
+            analyst_sentiment = get_recommendations_sentiment(ticker)
+            esg_data = get_esg_scores(ticker)
+            options_iv = get_options_implied_volatility(ticker, info)
+            week_52_position = get_52_week_position(info)
+            fcf_yield_data = calculate_fcf_yield(ticker, info, risk_free_rate)
+            growth_quality = calculate_growth_quality(ticker)
+
             # Calculate valuation consistency (needs all valuation data)
             valuation_consistency = check_valuation_consistency(
                 {
@@ -3510,6 +4218,18 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 **valuation_consistency,
                 **earnings_surprise_data,
                 **news_sentiment_data,
+                # NEW: Enhanced yfinance data metrics
+                **short_interest,
+                **analyst_upgrades,
+                **target_analysis,
+                **ownership_metrics,
+                **dividend_growth,
+                **analyst_sentiment,
+                **esg_data,
+                **options_iv,
+                **week_52_position,
+                **fcf_yield_data,
+                **growth_quality,
             }
 
             # Calculate Conviction Score (Fix for KeyError)

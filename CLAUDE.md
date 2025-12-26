@@ -60,12 +60,15 @@ pip install -e .
 - Deep analysis on Stage 1 candidates
 - Batch fetches 2-year price history for all tickers
 - Initializes ML predictor (AlphaPredictor from ml_engine.py)
-- For each ticker, calculates 40+ metrics including:
-  - Valuation: P/FCF, EV/EBITDA, Graham Number, DCF fair value with bull/bear/base scenarios, FCF Yield
-  - Quality: ROIC (TTM with average invested capital), Piotroski Score, Altman Z-Score (sector-adjusted), cash flow quality, Growth Quality Score
+- For each ticker, calculates 60+ metrics including:
+  - Valuation: P/FCF, EV/EBITDA, Graham Number, DCF fair value with bull/bear/base scenarios, FCF Yield, target price upside
+  - Quality: ROIC (TTM with average invested capital), Piotroski Score, Altman Z-Score (sector-adjusted), cash flow quality, Growth Quality Score, ESG scores
   - Growth: Revenue/Earnings CAGR, sector trend analysis, margin trend analysis, operating leverage
-  - Technical: RSI (with edge case handling), moving averages, support/resistance
-  - Sentiment: Earnings surprises, analyst recommendations, insider activity
+  - Technical: RSI (with edge case handling), moving averages, support/resistance, 52-week position
+  - Sentiment: Earnings surprises, analyst recommendations, analyst upgrades/downgrades momentum, recommendations sentiment score
+  - Ownership: Insider ownership %, institutional ownership %, recent insider purchases
+  - Risk: Short interest metrics, implied volatility from options, put/call ratio
+  - Dividends: Dividend growth CAGR, consistency rating, Dividend Aristocrat status
   - Sector-relative comparison: compares each stock to sector medians (cached for performance)
 - Applies conviction scoring system
 - Generates structured investment summaries
@@ -73,9 +76,10 @@ pip install -e .
 ### Key Components
 
 **main.py**:
-- Primary application logic
+- Primary application logic (~4500 lines)
 - Configuration loading from config.yaml
-- 40+ financial calculation functions
+- 60+ financial calculation functions including:
+  - New yfinance data metrics: `get_short_interest_metrics()`, `get_analyst_upgrades_downgrades()`, `get_target_price_analysis()`, `get_insider_ownership_metrics()`, `get_dividend_growth_analysis()`, `get_recommendations_sentiment()`, `get_esg_scores()`, `get_options_implied_volatility()`, `get_52_week_position()`
 - Stage 1 & Stage 2 orchestration
 - Portfolio optimization (Sharpe ratio, returns, Sortino ratio)
 - Backtesting engine
