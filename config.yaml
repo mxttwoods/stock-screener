@@ -6,7 +6,7 @@ beta:
   max: 2.5
 valuation:
   pe_max: 50.0 # Per RULES.md line 13
-  peg_max: 3 # Per RULES.md line 16-22 (strict requirement)
+  peg_max: 2 # Per RULES.md line 16-22 (strict requirement)
   pfcf_max: 50.0 # Per RULES.md line 26-28 (20-25 range, using 25 as max)
   margin_of_safety: 0.25 # Graham margin of safety for buy-below price
   dcf_scenarios: true # Enable bull/bear/base DCF scenario analysis
@@ -24,7 +24,7 @@ growth:
   ebitda_growth_min_pct: 6.0 # Per RULES.md line 33
   cagr_min_pct: 6.0 # Per RULES.md line 34-36
 balance_sheet:
-  debt_to_equity_max: 0.5 # Per RULES.md line 9-11 (D/E < 0.5)
+  debt_to_equity_max: 1 # Per RULES.md line 9-11 (D/E < 0.5)
   current_ratio_max: 5.0
   interest_coverage_min: 3.0 # Per RULES.md line 50-54 (EBIT/Interest > 3)
 analyst:
