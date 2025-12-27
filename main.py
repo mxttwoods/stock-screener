@@ -4,7 +4,6 @@ Based on RULES.md and IDEAS.md methodology
 """
 
 import argparse
-import json
 import logging
 import os
 import pickle
@@ -1879,25 +1878,6 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
         reasons.append("Low data confidence ⚠️")
 
     # ==========================================================================
-    # ML ALPHA SCORE (Predictive Signal)
-    # ==========================================================================
-    ml_score = stock_data.get("ML Alpha Score", 0.0) or 0.0
-
-    ml_adjustment = 0
-    if ml_score > 5.0:
-        ml_adjustment = 8
-        reasons.append(f"ML Strong Conviction (+{ml_score:.1f}%)")
-    elif ml_score > 2.0:
-        ml_adjustment = 5
-        reasons.append(f"ML Forecast Bullish (+{ml_score:.1f}%)")
-    elif ml_score < -2.0:
-        ml_adjustment = -8
-        reasons.append(f"ML Forecast Bearish ({ml_score:.1f}%)")
-    elif ml_score < 0.0:
-        ml_adjustment = -3
-        reasons.append(f"ML Slightly Bearish ({ml_score:.1f}%)")
-
-    # ==========================================================================
     # CALCULATE WEIGHTED FINAL SCORE
     # ==========================================================================
     # Clamp category scores to 0-100
@@ -1918,9 +1898,6 @@ def calculate_conviction_score(stock_data: dict) -> tuple[int, list[str]]:
 
     # Add bonus/penalty
     weighted_score += bonus_score
-
-    # Add ML adjustment
-    weighted_score += ml_adjustment
 
     # Apply risk penalty from config
     risk_penalty = risk_flag_count * RISK_PENALTY_PER_FLAG
@@ -2497,8 +2474,6 @@ def generate_investment_summary(
     Generate comprehensive, actionable investment advice.
     Returns dict with entry/exit strategies, position sizing, and narrative thesis.
     """
-    symbol = stock_data.get("Symbol", "Unknown")
-    current_price = stock_data.get("Current Price")
     conviction = conviction_score
 
     # Get action classification with rationale
@@ -3310,9 +3285,6 @@ def calculate_dcf_fair_value(
             ev = pv + pv_term
             eq_val = ev - net_debt
             return eq_val / shares_outstanding if shares_outstanding else None
-
-        # Base case (current calculation)
-        base_value = dcf_fair_value
 
         # Bull case: Growth +2%, WACC -1%
         bull_growth = min(0.20, fcf_growth + 0.02)  # Recalculate from original
@@ -5055,7 +5027,6 @@ def get_esg_scores(ticker: yf.Ticker) -> dict:
         env_score = get_score("environmentScore")
         social_score = get_score("socialScore")
         gov_score = get_score("governanceScore")
-        esg_perf = get_score("esgPerformance")
 
         # ESG risk interpretation (lower is better for risk scores)
         risk_level = None
@@ -5242,7 +5213,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     # Define relative tolerance from config, with a fallback
     SECTOR_TOLERANCE = CONFIG.get("sector_relative_tolerance", 1.2)  # e.g., 20% premium
 
-    # Phase 3: Batch fetch historical data for technicals and ML
+    # Phase 3: Batch fetch historical data for technicals
     try:
         batch_history = yf.download(
             tickers + ["SPY"],
@@ -5254,28 +5225,6 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
     except Exception as e:
         logger.debug(f"Batch download failed: {e}")
         batch_history = pd.DataFrame()
-
-    # Initialize ML Engine
-    from ml_engine import AlphaPredictor
-
-    ml_predictor = None
-    if not batch_history.empty:
-        data_dict = {}
-        if isinstance(batch_history.columns, pd.MultiIndex):
-            for t in tickers + ["SPY"]:
-                try:
-                    if t in batch_history.columns.levels[0]:
-                        data_dict[t] = batch_history[t]["Close"]
-                except KeyError:
-                    pass
-
-        if len(data_dict) > 1:
-            try:
-                ml_predictor = AlphaPredictor(data_dict, benchmark_symbol="SPY")
-                ml_predictor.train_model()
-            except Exception as e:
-                logger.debug(f"ML Training failed: {str(e)}")
-                ml_predictor = None
 
     print(f"  Analyzing {len(tickers)} stocks...")
     for i, symbol in enumerate(tickers):
@@ -5390,14 +5339,6 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
             peg = calculate_peg_ratio(ticker, info)
             peg_ratio = peg.get("PEG Ratio")
             sector_trend = fetch_sector_trend(current_sector)
-
-            # --- ML Alpha Prediction (Return Forecast) ---
-            ml_score = 0.0  # Default 0% return
-            if ml_predictor:
-                try:
-                    ml_score = ml_predictor.predict_alpha_probability(symbol)
-                except Exception:
-                    ml_score = 0.0
 
             # --- Stage 2 Filtering ---
             passed = True
@@ -5616,7 +5557,6 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 **rsi,
                 **peg,
                 **sector_trend,
-                "ML Alpha Score": ml_score,
                 **piotroski,
                 "EV/EBITDA": ev_ebitda,
                 **ttm_metrics,
@@ -5648,8 +5588,7 @@ def run_stage2(stage1_df: pd.DataFrame) -> pd.DataFrame:
                 **trend_data,
             }
 
-            # Calculate Conviction Score (Fix for KeyError)
-            # We explicitly pass ml_score to the calculation if needed, or rely on it being in result_row
+            # Calculate Conviction Score
             score, reasons = calculate_conviction_score(result_row)
             result_row["Conviction Score"] = score
             result_row["Conviction Reasons"] = "; ".join(reasons)
@@ -6016,11 +5955,6 @@ def parse_args():
         help="Skip portfolio optimization/backtest and only export screener results.",
     )
     parser.add_argument(
-        "--skip-pdf",
-        action="store_true",
-        help="Skip PDF research report generation.",
-    )
-    parser.add_argument(
         "--backtest",
         action="store_true",
         help="Run a 1-year backtest performance analysis of the final portfolio.",
@@ -6098,7 +6032,6 @@ def main():
 
     # Build optimized portfolio from passing stocks
     portfolio_df = pd.DataFrame()
-    advice_df = pd.DataFrame()
     if not passed_df.empty and not args.skip_portfolio:
         portfolio_df = build_optimized_portfolio(passed_df, objective=args.objective)
 
@@ -6116,20 +6049,7 @@ def main():
 
     if not passed_df.empty and not args.skip_summary:
         # Generate investment summaries
-        advice_df = generate_stock_summaries(passed_df)
-
-        # Generate Professional PDF Report
-        if not args.skip_pdf:
-            try:
-                from report_generator import generate_pdf_report
-
-                rf_rate = fetch_treasury_yield()
-                generate_pdf_report(advice_df, portfolio_df, rf_rate)
-            except ImportError:
-                print("\nSkipping PDF report: reportlab library not found.")
-                print("Install it with: pip install reportlab")
-            except Exception as e:
-                print(f"\nCould not generate PDF report: {e}")
+        generate_stock_summaries(passed_df)
 
     end_time = time.time()
     elapsed_time = timedelta(seconds=end_time - start_time)
